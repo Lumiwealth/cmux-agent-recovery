@@ -79,6 +79,7 @@ cmux-recovery memory-snapshot
 Largest workspaces in a recent window:
 
 ```sh
+cmux-recovery memory-list
 cmux-recovery memory-top --since 6h
 ```
 

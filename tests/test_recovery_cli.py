@@ -294,6 +294,12 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertAlmostEqual(row[3], 4.0)
             self.assertIn("mcp-server", row[4])
 
+        listed = self.run_cli("memory-list", "--quiet")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("Release Notes", listed.stdout)
+        self.assertIn("5.9 MB", listed.stdout)
+        self.assertIn("cpu=4.0%", listed.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

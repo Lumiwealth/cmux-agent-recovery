@@ -790,6 +790,32 @@ def cmd_memory_top(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_memory_list(args: argparse.Namespace) -> int:
+    with connect_db() as con:
+        latest = con.execute("SELECT max(observed_at) AS observed_at FROM memory_workspace_samples").fetchone()
+        observed_at = latest["observed_at"] if latest else None
+        if not observed_at:
+            return 0
+        rows = con.execute(
+            """
+            SELECT workspace_index, workspace_title, process_count, total_rss_kb, total_pmem, total_pcpu
+            FROM memory_workspace_samples
+            WHERE observed_at = ?
+            ORDER BY workspace_index
+            """,
+            (observed_at,),
+        ).fetchall()
+    if not args.quiet:
+        print(f"latest sample: {observed_at}")
+    for row in rows[: args.limit if args.limit is not None else None]:
+        print(
+            f"{row['workspace_index']}\t{format_mb(row['total_rss_kb'])}\t"
+            f"mem={float(row['total_pmem'] or 0.0):.1f}%\tcpu={float(row['total_pcpu'] or 0.0):.1f}%\t"
+            f"{row['process_count']} procs\t{row['workspace_title'] or ''}"
+        )
+    return 0
+
+
 def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
     score = 0
     current_title = current.get("normalized_title")
@@ -1284,6 +1310,11 @@ def build_parser() -> argparse.ArgumentParser:
     memory_top.add_argument("--since", default="6h")
     memory_top.add_argument("--limit", type=int, default=15)
     memory_top.set_defaults(func=cmd_memory_top)
+
+    memory_list = sub.add_parser("memory-list")
+    memory_list.add_argument("--limit", type=int)
+    memory_list.add_argument("--quiet", action="store_true")
+    memory_list.set_defaults(func=cmd_memory_list)
 
     recover = sub.add_parser("recover")
     recover.add_argument("choice", nargs="?", type=int)

@@ -54,6 +54,7 @@ Record and inspect workspace memory and CPU usage:
 
 ```sh
 cmux-recovery memory-snapshot
+cmux-recovery memory-list
 cmux-recovery memory-top --since 6h
 ```
 
