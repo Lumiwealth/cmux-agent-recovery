@@ -118,7 +118,24 @@ def connect_db() -> sqlite3.Connection:
     con.execute("PRAGMA busy_timeout = 10000")
     with SCHEMA.open("r", encoding="utf-8") as f:
         con.executescript(f.read())
+    ensure_schema_columns(con)
     return con
+
+
+def ensure_schema_columns(con: sqlite3.Connection) -> None:
+    required = {
+        "memory_workspace_samples": {
+            "total_pcpu": "REAL NOT NULL DEFAULT 0",
+        },
+        "memory_process_samples": {
+            "pcpu": "REAL NOT NULL DEFAULT 0",
+        },
+    }
+    for table, columns in required.items():
+        existing = {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def cmux_bin() -> str:
@@ -350,7 +367,7 @@ def collect_processes() -> list[dict[str, Any]]:
             return []
     try:
         proc = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,pgid=,tty=,rss=,pmem=,comm="],
+            ["ps", "-axo", "pid=,ppid=,pgid=,tty=,rss=,pmem=,pcpu=,comm="],
             text=True,
             capture_output=True,
             timeout=2.0,
@@ -362,10 +379,10 @@ def collect_processes() -> list[dict[str, Any]]:
         return []
     rows: list[dict[str, Any]] = []
     for line in proc.stdout.splitlines():
-        parts = line.strip().split(None, 6)
-        if len(parts) < 7:
+        parts = line.strip().split(None, 7)
+        if len(parts) < 8:
             continue
-        pid, ppid, pgid, tty, rss, pmem, command = parts
+        pid, ppid, pgid, tty, rss, pmem, pcpu, command = parts
         rows.append(
             {
                 "pid": int_or_none(pid),
@@ -374,6 +391,7 @@ def collect_processes() -> list[dict[str, Any]]:
                 "tty": None if tty == "??" else tty,
                 "rss_kb": int_or_none(rss) or 0,
                 "pmem": float(pmem) if re.match(r"^\d+(?:\.\d+)?$", pmem) else 0.0,
+                "pcpu": float(pcpu) if re.match(r"^\d+(?:\.\d+)?$", pcpu) else 0.0,
                 "command_name": Path(command).name,
             }
         )
@@ -427,12 +445,14 @@ def record_memory_snapshot(
         tree = process_tree_for_tty(processes, ws.get("tty"))
         total_rss = sum(int(row.get("rss_kb") or 0) for row in tree)
         total_pmem = sum(float(row.get("pmem") or 0.0) for row in tree)
+        total_pcpu = sum(float(row.get("pcpu") or 0.0) for row in tree)
         top = [
             {
                 "pid": row.get("pid"),
                 "name": row.get("command_name"),
                 "rss_kb": row.get("rss_kb"),
                 "pmem": row.get("pmem"),
+                "pcpu": row.get("pcpu"),
             }
             for row in tree[:8]
         ]
@@ -441,8 +461,8 @@ def record_memory_snapshot(
             INSERT INTO memory_workspace_samples (
               observed_at, source, window_id, window_ref, workspace_id, workspace_ref,
               workspace_index, workspace_title, normalized_title, surface_id, surface_ref,
-              tty, process_count, total_rss_kb, total_pmem, top_processes_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              tty, process_count, total_rss_kb, total_pmem, total_pcpu, top_processes_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 observed_at,
@@ -460,6 +480,7 @@ def record_memory_snapshot(
                 len(tree),
                 total_rss,
                 total_pmem,
+                total_pcpu,
                 json.dumps(top, separators=(",", ":"), ensure_ascii=False),
             ),
         )
@@ -468,9 +489,9 @@ def record_memory_snapshot(
             con.execute(
                 """
                 INSERT INTO memory_process_samples (
-                  sample_id, pid, ppid, pgid, tty, rss_kb, pmem, command_name,
+                  sample_id, pid, ppid, pgid, tty, rss_kb, pmem, pcpu, command_name,
                   depth, is_tty_attached
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sample_id,
@@ -480,12 +501,13 @@ def record_memory_snapshot(
                     row.get("tty"),
                     int(row.get("rss_kb") or 0),
                     float(row.get("pmem") or 0.0),
+                    float(row.get("pcpu") or 0.0),
                     row.get("command_name"),
                     row.get("depth"),
                     int(row.get("is_tty_attached") or 0),
                 ),
             )
-        samples.append({**ws, "sample_id": sample_id, "process_count": len(tree), "total_rss_kb": total_rss, "total_pmem": total_pmem, "top_processes": top})
+        samples.append({**ws, "sample_id": sample_id, "process_count": len(tree), "total_rss_kb": total_rss, "total_pmem": total_pmem, "total_pcpu": total_pcpu, "top_processes": top})
     return samples
 
 
@@ -695,6 +717,7 @@ def cmd_memory_snapshot(args: argparse.Namespace) -> int:
         for item in sorted(samples, key=lambda row: int(row.get("total_rss_kb") or 0), reverse=True)[: args.limit]:
             print(
                 f"{item.get('workspace_index', '')}\t{format_mb(item.get('total_rss_kb'))}\t"
+                f"cpu={float(item.get('total_pcpu') or 0.0):.1f}%\t"
                 f"{item.get('process_count', 0)} procs\t{item.get('workspace_title') or ''}"
             )
     return 0
@@ -729,7 +752,9 @@ def cmd_memory_top(args: argparse.Namespace) -> int:
                 "workspace_title": row["workspace_title"],
                 "latest_at": row["observed_at"],
                 "latest_rss_kb": row["total_rss_kb"],
+                "latest_pcpu": row["total_pcpu"],
                 "max_rss_kb": row["total_rss_kb"],
+                "max_pcpu": row["total_pcpu"],
                 "samples": 0,
                 "top_processes_json": row["top_processes_json"],
             },
@@ -740,15 +765,17 @@ def cmd_memory_top(args: argparse.Namespace) -> int:
             item["workspace_title"] = row["workspace_title"]
             item["latest_at"] = row["observed_at"]
             item["latest_rss_kb"] = row["total_rss_kb"]
+            item["latest_pcpu"] = row["total_pcpu"]
             item["top_processes_json"] = row["top_processes_json"]
         item["max_rss_kb"] = max(int(item["max_rss_kb"] or 0), int(row["total_rss_kb"] or 0))
+        item["max_pcpu"] = max(float(item["max_pcpu"] or 0.0), float(row["total_pcpu"] or 0.0))
     ranked = sorted(groups.values(), key=lambda item: int(item.get("max_rss_kb") or 0), reverse=True)
     for item in ranked[: args.limit]:
         top_names = ""
         try:
             top = json.loads(item.get("top_processes_json") or "[]")
             top_names = ", ".join(
-                f"{row.get('name')} {format_mb(row.get('rss_kb'))}"
+                f"{row.get('name')} {format_mb(row.get('rss_kb'))}/{float(row.get('pcpu') or 0.0):.1f}%"
                 for row in top[:3]
                 if row.get("name")
             )
@@ -756,7 +783,8 @@ def cmd_memory_top(args: argparse.Namespace) -> int:
             top_names = ""
         print(
             f"{item.get('workspace_index', '')}\tlatest={format_mb(item.get('latest_rss_kb'))}\t"
-            f"max={format_mb(item.get('max_rss_kb'))}\tsamples={item.get('samples')}\t"
+            f"max={format_mb(item.get('max_rss_kb'))}\tcpu={float(item.get('latest_pcpu') or 0.0):.1f}%\t"
+            f"max_cpu={float(item.get('max_pcpu') or 0.0):.1f}%\tsamples={item.get('samples')}\t"
             f"{item.get('workspace_title') or ''}\t{top_names}"
         )
     return 0

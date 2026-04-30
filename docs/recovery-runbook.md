@@ -66,9 +66,9 @@ Claude and Codex write on:
 
 This means renames and directory changes get refreshed during normal use.
 
-## Memory Telemetry
+## Memory And CPU Telemetry
 
-Every hook-triggered record also samples workspace memory usage. The sampler maps CMUX workspace ttys to their attached process trees, sums RSS, and stores top process names. It does not store full command lines by default because those can include secrets.
+Every hook-triggered record also samples workspace resource usage. The sampler maps CMUX workspace ttys to their attached process trees, sums RSS, `%MEM`, and `%CPU`, and stores top process names. It does not store full command lines by default because those can include secrets.
 
 Manual snapshot:
 

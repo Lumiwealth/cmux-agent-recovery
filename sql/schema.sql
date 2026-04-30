@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS memory_workspace_samples (
   process_count INTEGER NOT NULL DEFAULT 0,
   total_rss_kb INTEGER NOT NULL DEFAULT 0,
   total_pmem REAL NOT NULL DEFAULT 0,
+  total_pcpu REAL NOT NULL DEFAULT 0,
   top_processes_json TEXT
 );
 
@@ -147,6 +148,7 @@ CREATE TABLE IF NOT EXISTS memory_process_samples (
   tty TEXT,
   rss_kb INTEGER NOT NULL DEFAULT 0,
   pmem REAL NOT NULL DEFAULT 0,
+  pcpu REAL NOT NULL DEFAULT 0,
   command_name TEXT,
   depth INTEGER,
   is_tty_attached INTEGER NOT NULL DEFAULT 0,

@@ -50,7 +50,7 @@ Audit all current CMUX workspaces:
 cmux-recovery verify
 ```
 
-Record and inspect workspace memory usage:
+Record and inspect workspace memory and CPU usage:
 
 ```sh
 cmux-recovery memory-snapshot
@@ -86,7 +86,7 @@ The database stores:
 - transcript or rollout path
 - tool, model, permission/sandbox mode where available
 - first seen, last seen, and restore attempts
-- per-workspace memory samples: total RSS, process count, and top process names
+- per-workspace telemetry samples: total RSS, `%MEM`, `%CPU`, process count, and top process names
 
 Treat the database as private local state. Session IDs, transcript paths, and workspace titles can reveal sensitive project context.
 

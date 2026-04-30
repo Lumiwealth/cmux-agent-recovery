@@ -275,9 +275,9 @@ class RecoveryCliTests(unittest.TestCase):
         self.env["CMUX_RECOVERY_PS_JSON"] = json.dumps(
             [
                 {"pid": 10, "ppid": 1, "pgid": 10, "tty": "ttys999", "rss_kb": 1000, "pmem": 0.1, "command_name": "zsh"},
-                {"pid": 11, "ppid": 10, "pgid": 10, "tty": "ttys999", "rss_kb": 2000, "pmem": 0.2, "command_name": "codex"},
-                {"pid": 12, "ppid": 11, "pgid": 10, "tty": None, "rss_kb": 3000, "pmem": 0.3, "command_name": "mcp-server"},
-                {"pid": 20, "ppid": 1, "pgid": 20, "tty": "ttys123", "rss_kb": 5000, "pmem": 0.5, "command_name": "other"},
+                {"pid": 11, "ppid": 10, "pgid": 10, "tty": "ttys999", "rss_kb": 2000, "pmem": 0.2, "pcpu": 1.5, "command_name": "codex"},
+                {"pid": 12, "ppid": 11, "pgid": 10, "tty": None, "rss_kb": 3000, "pmem": 0.3, "pcpu": 2.5, "command_name": "mcp-server"},
+                {"pid": 20, "ppid": 1, "pgid": 20, "tty": "ttys123", "rss_kb": 5000, "pmem": 0.5, "pcpu": 9.0, "command_name": "other"},
             ]
         )
 
@@ -286,12 +286,13 @@ class RecoveryCliTests(unittest.TestCase):
 
         with sqlite3.connect(self.db) as con:
             row = con.execute(
-                "SELECT process_count, total_rss_kb, total_pmem, top_processes_json FROM memory_workspace_samples"
+                "SELECT process_count, total_rss_kb, total_pmem, total_pcpu, top_processes_json FROM memory_workspace_samples"
             ).fetchone()
             self.assertEqual(row[0], 3)
             self.assertEqual(row[1], 6000)
             self.assertAlmostEqual(row[2], 0.6)
-            self.assertIn("mcp-server", row[3])
+            self.assertAlmostEqual(row[3], 4.0)
+            self.assertIn("mcp-server", row[4])
 
 
 if __name__ == "__main__":
