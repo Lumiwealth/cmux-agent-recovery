@@ -1,0 +1,1017 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCHEMA = ROOT / "sql" / "schema.sql"
+DEFAULT_DB = ROOT / "state" / "cmux-recovery.sqlite"
+DEFAULT_LATEST_JSON = ROOT / "state" / "latest.json"
+DEFAULT_RESTORE_CWD = Path(os.environ.get("CMUX_RESTORE_CWD", "~/Development")).expanduser()
+DEFAULT_CMUX_BIN = Path("/Applications/cmux.app/Contents/Resources/bin/cmux")
+SESSION_ID_RE = re.compile(
+    r"\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,}-[0-9a-f-]{20,})\b",
+    re.IGNORECASE,
+)
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_time(value: str | None) -> float:
+    if not value:
+        return 0.0
+    raw = value.strip()
+    if not raw:
+        return 0.0
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        return dt.datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def normalize_title(value: str | None) -> str:
+    text = (value or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^0-9a-z]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def clean(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def same_path(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    return str(Path(left).expanduser()) == str(Path(right).expanduser())
+
+
+def file_observed_at(path: Path) -> str:
+    try:
+        timestamp = path.stat().st_mtime
+    except OSError:
+        return utc_now()
+    return dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def int_or_none(value: Any) -> int | None:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def tool_from_label(value: str | None) -> str | None:
+    text = (value or "").strip().lower()
+    if not text:
+        return None
+    if "codex" in text:
+        return "codex"
+    if "claude" in text:
+        return "claude"
+    return None
+
+
+def extract_session_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = SESSION_ID_RE.search(value)
+    return match.group(0) if match else None
+
+
+def db_path() -> Path:
+    return Path(os.environ.get("CMUX_RECOVERY_DB", str(DEFAULT_DB))).expanduser()
+
+
+def default_report_dirs() -> list[Path]:
+    raw = os.environ.get("CMUX_RECOVERY_REPORT_DIRS", "")
+    return [Path(item).expanduser() for item in raw.split(os.pathsep) if item.strip()]
+
+
+def connect_db() -> sqlite3.Connection:
+    path = db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path, timeout=10.0)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout = 10000")
+    with SCHEMA.open("r", encoding="utf-8") as f:
+        con.executescript(f.read())
+    return con
+
+
+def cmux_bin() -> str:
+    override = os.environ.get("CMUX_BIN")
+    if override:
+        return str(Path(override).expanduser())
+    if DEFAULT_CMUX_BIN.exists():
+        return str(DEFAULT_CMUX_BIN)
+    return "cmux"
+
+
+def run_cmux(args: list[str], timeout: float = 2.0) -> str | None:
+    try:
+        proc = subprocess.run(
+            [cmux_bin(), *args],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def run_cmux_json(args: list[str], timeout: float = 2.0) -> dict[str, Any] | list[Any] | None:
+    out = run_cmux(args, timeout=timeout)
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+def saved_session_path() -> Path:
+    return Path.home() / "Library/Application Support/cmux/session-com.cmuxterm.app.json"
+
+
+def saved_session_workspaces() -> list[dict[str, Any]]:
+    path = saved_session_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    rows: list[dict[str, Any]] = []
+    for window in data.get("windows", []) or []:
+        tab_manager = window.get("tabManager") or {}
+        for index, ws in enumerate(tab_manager.get("workspaces", []) or []):
+            rows.append(
+                {
+                    "index": index,
+                    "title": clean(ws.get("customTitle")) or clean(ws.get("processTitle")),
+                    "current_directory": clean(ws.get("currentDirectory")),
+                    "process_title": clean(ws.get("processTitle")),
+                    "focused_panel_id": clean(ws.get("focusedPanelId")),
+                    "panels": ws.get("panels") or [],
+                }
+            )
+    return rows
+
+
+def selected_surface(pane: dict[str, Any]) -> dict[str, Any] | None:
+    surfaces = pane.get("surfaces") or []
+    if not surfaces:
+        return None
+    selected_id = clean(pane.get("selected_surface_id"))
+    selected_ref = clean(pane.get("selected_surface_ref"))
+    for surface in surfaces:
+        if surface.get("selected") is True:
+            return surface
+    for surface in surfaces:
+        if clean(surface.get("id")) == selected_id or clean(surface.get("ref")) == selected_ref:
+            return surface
+    return surfaces[0]
+
+
+def tree_workspaces() -> list[dict[str, Any]]:
+    tree = run_cmux_json(["--id-format", "both", "tree", "--all", "--json"], timeout=4.0)
+    if not isinstance(tree, dict):
+        return []
+
+    saved = saved_session_workspaces()
+    out: list[dict[str, Any]] = []
+    for window in tree.get("windows", []) or []:
+        for ws in window.get("workspaces", []) or []:
+            pane = None
+            surface = None
+            for candidate in ws.get("panes", []) or []:
+                pane = candidate
+                surface = selected_surface(candidate)
+                if candidate.get("focused") or candidate.get("active"):
+                    break
+
+            workspace_index = ws.get("index")
+            title = clean(ws.get("title"))
+            saved_match = None
+            for row in saved:
+                if row.get("index") == workspace_index:
+                    saved_match = row
+                    break
+            if saved_match is None:
+                norm = normalize_title(title)
+                saved_match = next((row for row in saved if normalize_title(row.get("title")) == norm), None)
+
+            panel_match = None
+            if saved_match and surface:
+                sid = clean(surface.get("id"))
+                for panel in saved_match.get("panels") or []:
+                    if clean(panel.get("id")) == sid:
+                        panel_match = panel
+                        break
+
+            out.append(
+                {
+                    "window_id": clean(window.get("id")),
+                    "window_ref": clean(window.get("ref")),
+                    "workspace_id": clean(ws.get("id")),
+                    "workspace_ref": clean(ws.get("ref")),
+                    "workspace_index": workspace_index,
+                    "workspace_title": title,
+                    "normalized_title": normalize_title(title),
+                    "current_directory": clean((saved_match or {}).get("current_directory")),
+                    "process_title": clean((saved_match or {}).get("process_title")),
+                    "selected": 1 if ws.get("selected") else 0,
+                    "active": 1 if ws.get("active") else 0,
+                    "pinned": 1 if ws.get("pinned") else 0,
+                    "pane_id": clean((pane or {}).get("id")),
+                    "pane_ref": clean((pane or {}).get("ref")),
+                    "surface_id": clean((surface or {}).get("id")),
+                    "surface_ref": clean((surface or {}).get("ref")),
+                    "surface_index": (surface or {}).get("index"),
+                    "surface_title": clean((surface or {}).get("title")) or clean((panel_match or {}).get("title")),
+                    "tty": clean((surface or {}).get("tty")) or clean((panel_match or {}).get("ttyName")),
+                    "snapshot_json": json.dumps(ws, separators=(",", ":"), ensure_ascii=False),
+                }
+            )
+    return out
+
+
+def identify_current() -> dict[str, Any]:
+    identity = run_cmux_json(["--id-format", "both", "identify"], timeout=2.0)
+    current: dict[str, Any] = {}
+    if isinstance(identity, dict):
+        current = identity.get("caller") or identity.get("focused") or {}
+    env = os.environ
+    return {
+        "workspace_id": clean(current.get("workspace_id") or current.get("workspaceId") or env.get("CMUX_WORKSPACE_ID")),
+        "workspace_ref": clean(current.get("workspace_ref") or env.get("CMUX_WORKSPACE_REF")),
+        "surface_id": clean(current.get("surface_id") or current.get("surfaceId") or env.get("CMUX_SURFACE_ID")),
+        "surface_ref": clean(current.get("surface_ref")),
+        "tab_id": clean(current.get("tab_id") or current.get("tabId") or env.get("CMUX_TAB_ID")),
+        "pane_id": clean(current.get("pane_id") or current.get("paneId") or env.get("CMUX_PANE_ID")),
+        "pane_ref": clean(current.get("pane_ref")),
+    }
+
+
+def current_workspace() -> dict[str, Any]:
+    ident = identify_current()
+    workspaces = tree_workspaces()
+    for ws in workspaces:
+        if ident.get("surface_id") and ws.get("surface_id") == ident.get("surface_id"):
+            return {**ws, **{k: v for k, v in ident.items() if v}}
+        if ident.get("workspace_id") and ws.get("workspace_id") == ident.get("workspace_id"):
+            return {**ws, **{k: v for k, v in ident.items() if v}}
+        if ident.get("workspace_ref") and ws.get("workspace_ref") == ident.get("workspace_ref"):
+            return {**ws, **{k: v for k, v in ident.items() if v}}
+    selected = next((ws for ws in workspaces if ws.get("selected")), None)
+    if selected:
+        return {**selected, **{k: v for k, v in ident.items() if v}}
+    return {k: v for k, v in ident.items() if v}
+
+
+def insert_workspace_observations(con: sqlite3.Connection, source: str, rows: list[dict[str, Any]] | None = None) -> None:
+    observed_at = utc_now()
+    for row in rows if rows is not None else tree_workspaces():
+        con.execute(
+            """
+            INSERT INTO observed_workspaces (
+              observed_at, source, window_id, window_ref, workspace_id, workspace_ref,
+              workspace_index, workspace_title, normalized_title, current_directory,
+              process_title, selected, active, pinned, pane_id, pane_ref, surface_id,
+              surface_ref, surface_index, surface_title, tty, snapshot_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                observed_at,
+                source,
+                row.get("window_id"),
+                row.get("window_ref"),
+                row.get("workspace_id"),
+                row.get("workspace_ref"),
+                row.get("workspace_index"),
+                row.get("workspace_title"),
+                row.get("normalized_title"),
+                row.get("current_directory"),
+                row.get("process_title"),
+                int(row.get("selected") or 0),
+                int(row.get("active") or 0),
+                int(row.get("pinned") or 0),
+                row.get("pane_id"),
+                row.get("pane_ref"),
+                row.get("surface_id"),
+                row.get("surface_ref"),
+                row.get("surface_index"),
+                row.get("surface_title"),
+                row.get("tty"),
+                row.get("snapshot_json"),
+            ),
+        )
+
+
+def event_from_payload(payload: dict[str, Any], args: argparse.Namespace, workspace: dict[str, Any]) -> dict[str, Any]:
+    tool = args.tool
+    event = args.event or payload.get("hook_event_name") or "unknown"
+    session_id = (
+        payload.get("session_id")
+        or payload.get("sessionId")
+        or payload.get("conversation_id")
+        or payload.get("conversationId")
+        or payload.get("thread_id")
+        or payload.get("threadId")
+        or payload.get("id")
+    )
+    return {
+        "observed_at": utc_now(),
+        "tool": tool,
+        "event": str(event),
+        "source": args.source or f"{tool}-hook",
+        "session_id": clean(session_id),
+        "turn_id": clean(payload.get("turn_id") or payload.get("turnId")),
+        "cwd": clean(args.cwd or payload.get("cwd") or payload.get("current_directory") or payload.get("currentDirectory")),
+        "transcript_path": clean(payload.get("transcript_path") or payload.get("transcriptPath")),
+        "model": clean(payload.get("model")),
+        "permission_mode": clean(payload.get("permission_mode") or payload.get("permissionMode") or payload.get("approval_mode") or payload.get("approvalMode")),
+        "workspace_title": clean(workspace.get("workspace_title")) or clean(os.environ.get("CMUX_WORKSPACE_NAME")),
+        "normalized_title": normalize_title(clean(workspace.get("workspace_title")) or clean(os.environ.get("CMUX_WORKSPACE_NAME"))),
+        "workspace_id": clean(workspace.get("workspace_id")),
+        "workspace_ref": clean(workspace.get("workspace_ref")),
+        "workspace_index": workspace.get("workspace_index"),
+        "surface_id": clean(workspace.get("surface_id")),
+        "surface_ref": clean(workspace.get("surface_ref")),
+        "tab_id": clean(workspace.get("tab_id")),
+        "pane_id": clean(workspace.get("pane_id")),
+        "process_title": clean(workspace.get("process_title")),
+        "tty": clean(workspace.get("tty")),
+        "payload_json": json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+    }
+
+
+def upsert_event(con: sqlite3.Connection, row: dict[str, Any]) -> None:
+    con.execute(
+        """
+        INSERT INTO agent_events (
+          observed_at, tool, event, source, session_id, turn_id, cwd, transcript_path,
+          model, permission_mode, workspace_title, normalized_title, workspace_id,
+          workspace_ref, workspace_index, surface_id, surface_ref, tab_id, pane_id,
+          process_title, tty, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        tuple(row.get(k) for k in [
+            "observed_at", "tool", "event", "source", "session_id", "turn_id", "cwd",
+            "transcript_path", "model", "permission_mode", "workspace_title",
+            "normalized_title", "workspace_id", "workspace_ref", "workspace_index",
+            "surface_id", "surface_ref", "tab_id", "pane_id", "process_title", "tty",
+            "payload_json",
+        ]),
+    )
+    if not row.get("session_id"):
+        return
+    con.execute(
+        """
+        INSERT INTO session_bindings (
+          tool, session_id, first_seen, last_seen, last_event, last_source, cwd,
+          transcript_path, model, permission_mode, workspace_title, normalized_title,
+          workspace_id, workspace_ref, workspace_index, surface_id, surface_ref,
+          tab_id, pane_id, process_title, tty, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(tool, session_id) DO UPDATE SET
+          last_seen=excluded.last_seen,
+          last_event=excluded.last_event,
+          last_source=excluded.last_source,
+          cwd=COALESCE(NULLIF(excluded.cwd, ''), session_bindings.cwd),
+          transcript_path=COALESCE(NULLIF(excluded.transcript_path, ''), session_bindings.transcript_path),
+          model=COALESCE(NULLIF(excluded.model, ''), session_bindings.model),
+          permission_mode=COALESCE(NULLIF(excluded.permission_mode, ''), session_bindings.permission_mode),
+          workspace_title=COALESCE(NULLIF(excluded.workspace_title, ''), session_bindings.workspace_title),
+          normalized_title=COALESCE(NULLIF(excluded.normalized_title, ''), session_bindings.normalized_title),
+          workspace_id=COALESCE(NULLIF(excluded.workspace_id, ''), session_bindings.workspace_id),
+          workspace_ref=COALESCE(NULLIF(excluded.workspace_ref, ''), session_bindings.workspace_ref),
+          workspace_index=COALESCE(excluded.workspace_index, session_bindings.workspace_index),
+          surface_id=COALESCE(NULLIF(excluded.surface_id, ''), session_bindings.surface_id),
+          surface_ref=COALESCE(NULLIF(excluded.surface_ref, ''), session_bindings.surface_ref),
+          tab_id=COALESCE(NULLIF(excluded.tab_id, ''), session_bindings.tab_id),
+          pane_id=COALESCE(NULLIF(excluded.pane_id, ''), session_bindings.pane_id),
+          process_title=COALESCE(NULLIF(excluded.process_title, ''), session_bindings.process_title),
+          tty=COALESCE(NULLIF(excluded.tty, ''), session_bindings.tty),
+          payload_json=COALESCE(NULLIF(excluded.payload_json, ''), session_bindings.payload_json)
+        """,
+        (
+            row["tool"],
+            row["session_id"],
+            row["observed_at"],
+            row["observed_at"],
+            row["event"],
+            row["source"],
+            row.get("cwd"),
+            row.get("transcript_path"),
+            row.get("model"),
+            row.get("permission_mode"),
+            row.get("workspace_title"),
+            row.get("normalized_title"),
+            row.get("workspace_id"),
+            row.get("workspace_ref"),
+            row.get("workspace_index"),
+            row.get("surface_id"),
+            row.get("surface_ref"),
+            row.get("tab_id"),
+            row.get("pane_id"),
+            row.get("process_title"),
+            row.get("tty"),
+            row.get("payload_json"),
+        ),
+    )
+
+
+def export_latest(con: sqlite3.Connection) -> None:
+    latest = {
+        "updated_at": utc_now(),
+        "database": str(db_path()),
+        "recent_sessions": [
+            dict(row)
+            for row in con.execute(
+                """
+                SELECT tool, session_id, last_seen, workspace_title, cwd, transcript_path
+                FROM session_bindings
+                ORDER BY last_seen DESC
+                LIMIT 50
+                """
+            )
+        ],
+    }
+    DEFAULT_LATEST_JSON.parent.mkdir(parents=True, exist_ok=True)
+    DEFAULT_LATEST_JSON.write_text(json.dumps(latest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        payload = {"raw": raw}
+    with connect_db() as con:
+        workspace = current_workspace()
+        insert_workspace_observations(con, f"{args.tool}-record")
+        row = event_from_payload(payload, args, workspace)
+        upsert_event(con, row)
+        export_latest(con)
+    return 0
+
+
+def cmd_record_resume(args: argparse.Namespace) -> int:
+    payload = {
+        "session_id": args.session_id,
+        "cwd": args.cwd,
+        "hook_event_name": args.event,
+    }
+    args.source = args.source or f"{args.tool}-zsh-wrapper"
+    with connect_db() as con:
+        workspace = current_workspace()
+        insert_workspace_observations(con, f"{args.tool}-resume")
+        row = event_from_payload(payload, args, workspace)
+        upsert_event(con, row)
+        export_latest(con)
+    return 0
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    with connect_db() as con:
+        rows = tree_workspaces()
+        insert_workspace_observations(con, args.source, rows)
+        export_latest(con)
+    if not args.quiet:
+        print(f"snapshot: {len(rows)} workspaces")
+    return 0
+
+
+def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
+    score = 0
+    current_title = current.get("normalized_title")
+    candidate_title = candidate["normalized_title"]
+    title_match = bool(current_title and candidate_title and current_title == candidate_title)
+    surface_match = bool(current.get("surface_id") and current.get("surface_id") == candidate["surface_id"])
+    workspace_id_match = bool(current.get("workspace_id") and current.get("workspace_id") == candidate["workspace_id"])
+    raw_workspace_ref_match = bool(current.get("workspace_ref") and current.get("workspace_ref") == candidate["workspace_ref"])
+    raw_index_match = bool(
+        current.get("workspace_index") is not None
+        and candidate["workspace_index"] is not None
+        and current.get("workspace_index") == candidate["workspace_index"]
+        and candidate_title
+    )
+    ordinal_match_allowed = not current_title or title_match
+    workspace_ref_match = raw_workspace_ref_match and ordinal_match_allowed
+    index_match = raw_index_match and ordinal_match_allowed
+    cwd_match = same_path(current.get("current_directory"), candidate["cwd"])
+
+    # Title text is matched literally. User-defined title markers may make a
+    # title more unique, but they are not interpreted as tool metadata.
+    if not (title_match or surface_match or workspace_id_match or workspace_ref_match or index_match):
+        return 0
+
+    if surface_match:
+        score += 120
+    if workspace_id_match:
+        score += 90
+    if workspace_ref_match:
+        score += 35
+    if title_match:
+        score += 75
+    if cwd_match:
+        score += 25
+    if index_match:
+        score += 8
+    age = max(0.0, time.time() - parse_time(candidate["last_seen"]))
+    if age < 6 * 60 * 60:
+        score += 25
+    elif age < 24 * 60 * 60:
+        score += 18
+    elif age < 7 * 24 * 60 * 60:
+        score += 10
+    elif age < 30 * 24 * 60 * 60:
+        score += 4
+    return score
+
+
+def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = con.execute(
+        """
+        SELECT * FROM session_bindings
+        WHERE session_id IS NOT NULL AND session_id != ''
+        ORDER BY last_seen DESC
+        LIMIT 500
+        """
+    ).fetchall()
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        score = score_candidate(current, row)
+        if score <= 0:
+            continue
+        item = dict(row)
+        item["score"] = score
+        item["title_match"] = bool(current.get("normalized_title") and current.get("normalized_title") == item.get("normalized_title"))
+        item["command"] = resume_command(item)
+        candidates.append(item)
+    candidates.sort(key=lambda item: (item["score"], parse_time(item.get("last_seen"))), reverse=True)
+    return candidates
+
+
+def resume_command(candidate: dict[str, Any]) -> str:
+    cwd = str(DEFAULT_RESTORE_CWD)
+    sid = str(candidate["session_id"])
+    if candidate["tool"] == "codex":
+        return f"cd {shlex.quote(cwd)} && codex -C {shlex.quote(cwd)} resume {shlex.quote(sid)}"
+    return f"cd {shlex.quote(cwd)} && claude --resume {shlex.quote(sid)}"
+
+
+def print_candidates(candidates: list[dict[str, Any]], limit: int = 8) -> None:
+    for idx, item in enumerate(candidates[:limit], start=1):
+        title = item.get("workspace_title") or "(no title)"
+        cwd = item.get("cwd") or ""
+        print(
+            f"{idx}. {item['tool']} score={item['score']} last={item.get('last_seen')} "
+            f"title={title!r} cwd={cwd}"
+        )
+
+
+def log_restore(con: sqlite3.Connection, action: str, status: str, current: dict[str, Any], selected: dict[str, Any] | None, candidates: list[dict[str, Any]]) -> None:
+    con.execute(
+        """
+        INSERT INTO restore_events (
+          observed_at, action, status, workspace_title, normalized_title, workspace_id,
+          surface_id, selected_tool, selected_session_id, score, command, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now(),
+            action,
+            status,
+            current.get("workspace_title"),
+            current.get("normalized_title"),
+            current.get("workspace_id"),
+            current.get("surface_id"),
+            selected.get("tool") if selected else None,
+            selected.get("session_id") if selected else None,
+            selected.get("score") if selected else None,
+            selected.get("command") if selected else None,
+            json.dumps({"candidates": candidates[:10]}, default=str, ensure_ascii=False),
+        ),
+    )
+
+
+def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
+    if args.choice is not None:
+        index = args.choice - 1
+        if index < 0 or index >= len(candidates):
+            return "invalid-choice", None
+        return "selected", candidates[index]
+    if not candidates:
+        return "missing", None
+    top = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else None
+    if top["score"] >= 75 and (second is None or top["score"] - second["score"] >= 20):
+        return "selected", top
+    if top.get("title_match") and top["score"] >= 75 and second is not None and second.get("title_match"):
+        recency_gap = parse_time(top.get("last_seen")) - parse_time(second.get("last_seen"))
+        if recency_gap >= 5 * 60:
+            return "selected", top
+    return "ambiguous", None
+
+
+def cmd_recover(args: argparse.Namespace) -> int:
+    with connect_db() as con:
+        rows = tree_workspaces()
+        insert_workspace_observations(con, "recover", rows)
+        current = current_workspace()
+        if not current.get("normalized_title"):
+            current["normalized_title"] = normalize_title(current.get("workspace_title"))
+        candidates = load_candidates(con, current)
+        status, selected = choose_candidate(args, candidates)
+        log_restore(con, "recover-dry-run" if args.dry_run else "recover", status, current, selected, candidates)
+        con.commit()
+
+    if status == "missing":
+        print("cmr: no recoverable Claude/Codex session found for this workspace.")
+        return 2
+    if status == "ambiguous":
+        print("cmr: multiple possible sessions found. Pick one with `cmr N`:")
+        print_candidates(candidates)
+        return 3
+    if status == "invalid-choice":
+        print("cmr: invalid choice. Current candidates:")
+        print_candidates(candidates)
+        return 4
+
+    assert selected is not None
+    command = selected["command"]
+    if args.dry_run:
+        print(command)
+        return 0
+
+    cwd = str(DEFAULT_RESTORE_CWD)
+    os.chdir(cwd)
+    if selected["tool"] == "codex":
+        os.execvp("codex", ["codex", "-C", cwd, "resume", selected["session_id"]])
+    os.execvp("claude", ["claude", "--resume", selected["session_id"]])
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    with connect_db() as con:
+        rows = tree_workspaces()
+        insert_workspace_observations(con, "verify", rows)
+        chooser_args = argparse.Namespace(choice=None)
+        for ws in rows:
+            candidates = load_candidates(con, ws)
+            status, selected = choose_candidate(chooser_args, candidates)
+            status = "exact" if status == "selected" else status
+            top = selected or (candidates[0] if candidates else None)
+            print(
+                f"{ws.get('workspace_index', '')}\t{status}\t{ws.get('workspace_title') or ''}\t"
+                f"{top.get('tool') if top else ''}\t{top.get('session_id') if top else ''}\t"
+                f"{top.get('last_seen') if top else ''}\t{top.get('score') if top else ''}"
+            )
+    return 0
+
+
+def record_imported_session(
+    con: sqlite3.Connection,
+    *,
+    source: str,
+    observed_at: str,
+    tool: str | None,
+    session_id: str | None,
+    title: str | None = None,
+    cwd: str | None = None,
+    workspace_index: int | None = None,
+    workspace_id: str | None = None,
+    workspace_ref: str | None = None,
+    surface_id: str | None = None,
+    surface_ref: str | None = None,
+    command: str | None = None,
+) -> bool:
+    if tool not in {"claude", "codex"} or not session_id:
+        return False
+    row = {
+        "observed_at": observed_at,
+        "tool": tool,
+        "event": source,
+        "source": source,
+        "session_id": session_id,
+        "turn_id": None,
+        "cwd": cwd,
+        "transcript_path": None,
+        "model": None,
+        "permission_mode": None,
+        "workspace_title": title,
+        "normalized_title": normalize_title(title),
+        "workspace_id": workspace_id,
+        "workspace_ref": workspace_ref,
+        "workspace_index": workspace_index,
+        "surface_id": surface_id,
+        "surface_ref": surface_ref,
+        "tab_id": surface_id,
+        "pane_id": None,
+        "process_title": None,
+        "tty": None,
+        "payload_json": json.dumps({"command": command} if command else {}, separators=(",", ":"), ensure_ascii=False),
+    }
+    upsert_event(con, row)
+    return True
+
+
+def import_legacy_ledger(con: sqlite3.Connection, path: Path) -> int:
+    if not path.exists():
+        return 0
+    count = 0
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for raw in reader:
+            source = raw.get("source") or "legacy-ledger"
+            tool = "codex" if "codex" in source else "claude" if "claude" in source else None
+            if not tool or not raw.get("session_id"):
+                continue
+            row = {
+                "observed_at": raw.get("timestamp_utc") or utc_now(),
+                "tool": tool,
+                "event": raw.get("event") or source,
+                "source": source,
+                "session_id": raw.get("session_id"),
+                "turn_id": None,
+                "cwd": raw.get("payload_cwd") or raw.get("pwd"),
+                "transcript_path": raw.get("transcript_path"),
+                "model": None,
+                "permission_mode": None,
+                "workspace_title": raw.get("workspace_name") if raw.get("workspace_name") != "unknown" else None,
+                "normalized_title": normalize_title(raw.get("workspace_name") if raw.get("workspace_name") != "unknown" else None),
+                "workspace_id": raw.get("cmux_workspace_id"),
+                "workspace_ref": raw.get("workspace_ref"),
+                "workspace_index": None,
+                "surface_id": raw.get("cmux_surface_id"),
+                "surface_ref": None,
+                "tab_id": raw.get("cmux_tab_id"),
+                "pane_id": None,
+                "process_title": None,
+                "tty": None,
+                "payload_json": "{}",
+            }
+            upsert_event(con, row)
+            count += 1
+    return count
+
+
+def import_restore_manifest(con: sqlite3.Connection, path: Path) -> int:
+    if not path.exists():
+        return 0
+    observed_at = file_observed_at(path)
+    count = 0
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for raw in reader:
+            command = clean(raw.get("best_resume_command"))
+            if record_imported_session(
+                con,
+                source=f"restore-manifest:{path.name}",
+                observed_at=observed_at,
+                tool=tool_from_label(raw.get("best_tool")),
+                session_id=clean(raw.get("best_session_id")) or extract_session_id(command),
+                title=clean(raw.get("title")),
+                cwd=clean(raw.get("current_directory")),
+                workspace_index=int_or_none(raw.get("index")),
+                surface_id=clean(raw.get("current_surface_id")),
+                command=command,
+            ):
+                count += 1
+    return count
+
+
+def import_tab_inventory(con: sqlite3.Connection, path: Path) -> int:
+    if not path.exists():
+        return 0
+    observed_at = file_observed_at(path)
+    count = 0
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for raw in reader:
+            command = clean(raw.get("best_resume_command"))
+            if record_imported_session(
+                con,
+                source=f"tab-inventory:{path.name}",
+                observed_at=observed_at,
+                tool=tool_from_label(raw.get("best_tool")),
+                session_id=clean(raw.get("best_session_id")) or extract_session_id(command),
+                title=clean(raw.get("title")),
+                cwd=clean(raw.get("current_directory") or raw.get("precrash_directory")),
+                workspace_index=int_or_none(raw.get("index")),
+                surface_id=clean(raw.get("current_surface_id") or raw.get("precrash_surface_id")),
+                command=command,
+            ):
+                count += 1
+    return count
+
+
+def import_current_audit(con: sqlite3.Connection, path: Path) -> int:
+    if not path.exists():
+        return 0
+    observed_at = file_observed_at(path)
+    count = 0
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f, delimiter="\t")
+        for raw in reader:
+            if len(raw) < 11:
+                continue
+            index, _status, _expected_tool, best_tool, title, workspace_ref, surface_ref, surface_id, session_id, _pid, cwd = raw[:11]
+            if record_imported_session(
+                con,
+                source=f"current-audit:{path.name}",
+                observed_at=observed_at,
+                tool=tool_from_label(best_tool),
+                session_id=clean(session_id),
+                title=clean(title),
+                cwd=clean(cwd),
+                workspace_index=int_or_none(index),
+                workspace_ref=clean(workspace_ref),
+                surface_ref=clean(surface_ref),
+                surface_id=clean(surface_id),
+            ):
+                count += 1
+    return count
+
+
+def import_old_sessions_backup(con: sqlite3.Connection, path: Path) -> int:
+    if not path.exists():
+        return 0
+    observed_at = file_observed_at(path)
+    count = 0
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f, delimiter="\t")
+        for raw in reader:
+            if len(raw) < 4:
+                continue
+            title, cwd, tool_label, command = raw[:4]
+            if record_imported_session(
+                con,
+                source=f"old-sessions-backup:{path.name}",
+                observed_at=observed_at,
+                tool=tool_from_label(tool_label),
+                session_id=extract_session_id(command),
+                title=clean(title),
+                cwd=clean(cwd),
+                command=clean(command),
+            ):
+                count += 1
+    return count
+
+
+def import_known_reports(con: sqlite3.Connection, report_dirs: list[Path]) -> dict[str, int]:
+    counts = {
+        "restore_manifest": 0,
+        "tab_inventory": 0,
+        "current_audit": 0,
+        "old_backup": 0,
+    }
+    for directory in report_dirs:
+        counts["restore_manifest"] += import_restore_manifest(con, directory / "cmux-restore-armed.latest.tsv")
+        counts["tab_inventory"] += import_tab_inventory(con, directory / "cmux-tab-id-inventory.tsv")
+        counts["current_audit"] += import_current_audit(con, directory / "current-audit.tsv")
+        counts["old_backup"] += import_old_sessions_backup(con, directory / "old-cmux-sessions-backup-parsed.tsv")
+    return counts
+
+
+def import_codex_state(con: sqlite3.Connection, path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        src.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return 0
+    count = 0
+    try:
+        for row in src.execute(
+            """
+            SELECT id, updated_at, cwd, rollout_path, title, model, approval_mode, sandbox_policy
+            FROM threads
+            WHERE archived = 0
+            ORDER BY updated_at DESC
+            LIMIT 2000
+            """
+        ):
+            observed = dt.datetime.fromtimestamp(int(row["updated_at"]), dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            event = {
+                "observed_at": observed,
+                "tool": "codex",
+                "event": "codex-state-import",
+                "source": "codex-state",
+                "session_id": row["id"],
+                "turn_id": None,
+                "cwd": row["cwd"],
+                "transcript_path": row["rollout_path"],
+                "model": row["model"],
+                "permission_mode": row["approval_mode"],
+                "workspace_title": None,
+                "normalized_title": None,
+                "workspace_id": None,
+                "workspace_ref": None,
+                "workspace_index": None,
+                "surface_id": None,
+                "surface_ref": None,
+                "tab_id": None,
+                "pane_id": None,
+                "process_title": row["title"],
+                "tty": None,
+                "payload_json": "{}",
+            }
+            upsert_event(con, event)
+            count += 1
+    except sqlite3.Error:
+        pass
+    finally:
+        src.close()
+    return count
+
+
+def cmd_import_legacy(args: argparse.Namespace) -> int:
+    with connect_db() as con:
+        ledger_count = import_legacy_ledger(con, Path(args.ledger).expanduser())
+        report_dirs = [Path(value).expanduser() for value in args.report_dir] if args.report_dir else default_report_dirs()
+        report_counts = import_known_reports(con, report_dirs)
+        codex_count = import_codex_state(con, Path(args.codex_state).expanduser())
+        export_latest(con)
+    report_summary = " ".join(f"{key}={value}" for key, value in report_counts.items())
+    print(f"imported: ledger={ledger_count} {report_summary} codex_state={codex_count}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="cmux-recovery")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    record = sub.add_parser("record")
+    record.add_argument("--tool", required=True, choices=["claude", "codex"])
+    record.add_argument("--event")
+    record.add_argument("--source")
+    record.add_argument("--cwd")
+    record.set_defaults(func=cmd_record)
+
+    resume = sub.add_parser("record-resume")
+    resume.add_argument("--tool", required=True, choices=["claude", "codex"])
+    resume.add_argument("--session-id", required=True)
+    resume.add_argument("--event", default="resume-command")
+    resume.add_argument("--source")
+    resume.add_argument("--cwd")
+    resume.set_defaults(func=cmd_record_resume)
+
+    snapshot = sub.add_parser("snapshot")
+    snapshot.add_argument("--source", default="manual-snapshot")
+    snapshot.add_argument("--quiet", action="store_true")
+    snapshot.set_defaults(func=cmd_snapshot)
+
+    recover = sub.add_parser("recover")
+    recover.add_argument("choice", nargs="?", type=int)
+    recover.add_argument("--dry-run", action="store_true")
+    recover.set_defaults(func=cmd_recover)
+
+    verify = sub.add_parser("verify")
+    verify.set_defaults(func=cmd_verify)
+
+    legacy = sub.add_parser("import-legacy")
+    legacy.add_argument("--ledger", default=os.environ.get("CMUX_RECOVERY_LEDGER", "~/.cmux-agent-recovery/session-ledger.tsv"))
+    legacy.add_argument("--codex-state", default=os.environ.get("CMUX_CODEX_STATE", "~/.codex/state_5.sqlite"))
+    legacy.add_argument("--report-dir", action="append")
+    legacy.set_defaults(func=cmd_import_legacy)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
