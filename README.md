@@ -58,6 +58,20 @@ cmux-recovery memory-list
 cmux-recovery memory-top --since 6h
 ```
 
+Plan a safe memory trim:
+
+```sh
+cmux-recovery trim
+```
+
+`trim` samples current workspace memory, finds older workspaces with a safe Claude/Codex resume ID, skips the active workspace by default, and prints what it would stop. To actually stop those agents while leaving the CMUX tabs in place:
+
+```sh
+cmux-recovery trim --execute
+```
+
+After a tab is stopped, run `cmr` inside that tab to resume it.
+
 Import old recovery reports and local agent state:
 
 ```sh
@@ -99,6 +113,7 @@ Treat the database as private local state. Session IDs, transcript paths, and wo
 - Missing matches do nothing.
 - Workspace titles are matched literally and are not parsed for tool metadata.
 - Restore is one workspace at a time by default.
+- `trim` only stops workspaces with a recoverable session ID, skips the active workspace by default, and runs as a dry run unless `--execute` is passed.
 
 ## Install
 

@@ -83,6 +83,39 @@ cmux-recovery memory-list
 cmux-recovery memory-top --since 6h
 ```
 
+## Reducing Memory Pressure
+
+Use `trim` when too many recovered agents are running at once:
+
+```sh
+cmux-recovery trim
+```
+
+The default mode is a dry run. It takes a fresh memory snapshot, looks for older workspaces that have a safe resume ID, skips the active workspace, and shows the agents it would stop to get under the target memory level.
+
+To actually stop those agents and keep the CMUX tabs available:
+
+```sh
+cmux-recovery trim --execute
+```
+
+Default target:
+
+```text
+30 GB total sampled workspace RSS
+```
+
+Useful options:
+
+```sh
+cmux-recovery trim --target-gb 24
+cmux-recovery trim --min-age 2h
+cmux-recovery trim --limit 5
+cmux-recovery trim --force
+```
+
+The default stop method is `respawn-pane`, which restarts the terminal surface instead of closing the workspace. Run `cmr` in that tab later to resume the saved Claude/Codex session.
+
 Disable automatic sampling:
 
 ```sh

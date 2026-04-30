@@ -97,6 +97,10 @@ class RecoveryCliTests(unittest.TestCase):
                     print(os.environ.get("CMUX_FAKE_TREE_JSON", tree_json))
                 elif "reload-config" in args:
                     print("OK Reloaded config")
+                elif "respawn-pane" in args:
+                    print("OK Respawned pane")
+                elif "send-key" in args:
+                    print("OK Sent key")
                 else:
                     print("unknown fake cmux command", args, file=sys.stderr)
                     raise SystemExit(1)
@@ -299,6 +303,55 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("Release Notes", listed.stdout)
         self.assertIn("5.9 MB", listed.stdout)
         self.assertIn("cpu=4.0%", listed.stdout)
+
+    def test_trim_only_stops_recoverable_sessions_when_executed(self) -> None:
+        self.env.pop("CMUX_RECOVERY_DISABLE_MEMORY", None)
+        self.env["CMUX_RECOVERY_PS_JSON"] = json.dumps(
+            [
+                {"pid": 10, "ppid": 1, "pgid": 10, "tty": "ttys999", "rss_kb": 1000, "pmem": 0.1, "pcpu": 0.1, "command_name": "zsh"},
+                {"pid": 11, "ppid": 10, "pgid": 10, "tty": "ttys999", "rss_kb": 5000, "pmem": 0.5, "pcpu": 3.0, "command_name": "claude"},
+            ]
+        )
+        recorded = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "claude-trim-session", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        guarded = self.run_cli("trim", "--min-mb", "1", "--min-age", "0s", "--target-gb", "0.001")
+        self.assertEqual(guarded.returncode, 0, guarded.stderr)
+        self.assertIn("planned=0", guarded.stdout)
+
+        dry = self.run_cli("trim", "--include-active", "--min-mb", "1", "--min-age", "0s", "--target-gb", "0.001")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("would stop", dry.stdout)
+        self.assertIn("claude-trim-session", dry.stdout)
+
+        executed = self.run_cli(
+            "trim",
+            "--include-active",
+            "--min-mb",
+            "1",
+            "--min-age",
+            "0s",
+            "--target-gb",
+            "0.001",
+            "--execute",
+        )
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        self.assertIn("stopped", executed.stdout)
+
+        with sqlite3.connect(self.db) as con:
+            row = con.execute(
+                "SELECT status, method, stopped_count FROM trim_events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(row[0], "executed")
+            self.assertEqual(row[1], "respawn")
+            self.assertEqual(row[2], 1)
 
 
 if __name__ == "__main__":

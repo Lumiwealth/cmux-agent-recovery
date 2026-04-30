@@ -695,6 +695,28 @@ def format_mb(kb: int | float | None) -> str:
     return f"{(float(kb or 0) / 1024):.1f} MB"
 
 
+def mb_to_kb(value: float) -> int:
+    return int(value * 1024)
+
+
+def gb_to_kb(value: float) -> int:
+    return int(value * 1024 * 1024)
+
+
+def format_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h"
+    days = hours // 24
+    return f"{days}d"
+
+
 def parse_duration(value: str) -> float:
     text = value.strip().lower()
     match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text)
@@ -814,6 +836,30 @@ def cmd_memory_list(args: argparse.Namespace) -> int:
             f"{row['process_count']} procs\t{row['workspace_title'] or ''}"
         )
     return 0
+
+
+def latest_memory_samples(con: sqlite3.Connection) -> list[dict[str, Any]]:
+    latest = con.execute("SELECT max(observed_at) AS observed_at FROM memory_workspace_samples").fetchone()
+    observed_at = latest["observed_at"] if latest else None
+    if not observed_at:
+        return []
+    rows = con.execute(
+        """
+        SELECT *
+        FROM memory_workspace_samples
+        WHERE observed_at = ?
+        ORDER BY workspace_index
+        """,
+        (observed_at,),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item.setdefault("selected", 0)
+        item.setdefault("active", 0)
+        item.setdefault("pinned", 0)
+        out.append(item)
+    return out
 
 
 def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
@@ -947,6 +993,235 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
         if recency_gap >= 5 * 60:
             return "selected", top
     return "ambiguous", None
+
+
+def trim_candidate_rows(
+    con: sqlite3.Connection,
+    samples: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> tuple[int, int, list[dict[str, Any]], list[dict[str, Any]]]:
+    total_rss_kb = sum(int(row.get("total_rss_kb") or 0) for row in samples)
+    target_rss_kb = gb_to_kb(args.target_gb)
+    min_rss_kb = mb_to_kb(args.min_mb)
+    min_age_seconds = parse_duration(args.min_age)
+    now = time.time()
+    chooser_args = argparse.Namespace(choice=None)
+    candidates: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+
+    for sample in samples:
+        rss_kb = int(sample.get("total_rss_kb") or 0)
+        if rss_kb < min_rss_kb:
+            continue
+        if not args.include_active and (sample.get("selected") or sample.get("active")):
+            skipped.append({"workspace": sample, "reason": "active"})
+            continue
+        if not (sample.get("workspace_ref") or sample.get("workspace_id")) or not (sample.get("surface_ref") or sample.get("surface_id")):
+            skipped.append({"workspace": sample, "reason": "missing-cmux-target"})
+            continue
+
+        session_candidates = load_candidates(con, sample)
+        status, selected = choose_candidate(chooser_args, session_candidates)
+        if status != "selected" or selected is None:
+            skipped.append({"workspace": sample, "reason": status, "candidates": session_candidates[:5]})
+            continue
+
+        age_seconds = max(0.0, now - parse_time(selected.get("last_seen")))
+        if age_seconds < min_age_seconds:
+            skipped.append({"workspace": sample, "reason": "recent", "selected": selected, "age_seconds": age_seconds})
+            continue
+
+        candidates.append(
+            {
+                "workspace": sample,
+                "selected": selected,
+                "rss_kb": rss_kb,
+                "age_seconds": age_seconds,
+            }
+        )
+
+    candidates.sort(key=lambda item: (int(item["rss_kb"]), float(item["age_seconds"])), reverse=True)
+    return total_rss_kb, target_rss_kb, candidates, skipped
+
+
+def plan_trim(args: argparse.Namespace, total_rss_kb: int, target_rss_kb: int, candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    planned: list[dict[str, Any]] = []
+    projected_rss_kb = total_rss_kb
+    if not args.force and total_rss_kb <= target_rss_kb:
+        return planned, projected_rss_kb
+    for item in candidates:
+        if len(planned) >= args.limit:
+            break
+        planned.append(item)
+        projected_rss_kb = max(0, projected_rss_kb - int(item["rss_kb"]))
+        if not args.force and projected_rss_kb <= target_rss_kb:
+            break
+    return planned, projected_rss_kb
+
+
+def trim_item_summary(item: dict[str, Any], status: str | None = None) -> dict[str, Any]:
+    workspace = item["workspace"]
+    selected = item["selected"]
+    out = {
+        "status": status,
+        "workspace_index": workspace.get("workspace_index"),
+        "workspace_title": workspace.get("workspace_title"),
+        "workspace_ref": workspace.get("workspace_ref"),
+        "workspace_id": workspace.get("workspace_id"),
+        "surface_ref": workspace.get("surface_ref"),
+        "surface_id": workspace.get("surface_id"),
+        "tool": selected.get("tool"),
+        "session_id": selected.get("session_id"),
+        "last_seen": selected.get("last_seen"),
+        "rss_kb": item.get("rss_kb"),
+        "age_seconds": item.get("age_seconds"),
+    }
+    return out
+
+
+def log_trim(
+    con: sqlite3.Connection,
+    *,
+    action: str,
+    status: str,
+    method: str,
+    total_rss_kb: int,
+    target_rss_kb: int,
+    projected_rss_kb: int,
+    candidates: list[dict[str, Any]],
+    planned: list[dict[str, Any]],
+    stopped_count: int,
+    skipped: list[dict[str, Any]],
+) -> None:
+    con.execute(
+        """
+        INSERT INTO trim_events (
+          observed_at, action, status, method, total_rss_kb, target_rss_kb,
+          projected_rss_kb, candidate_count, stopped_count, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            utc_now(),
+            action,
+            status,
+            method,
+            total_rss_kb,
+            target_rss_kb,
+            projected_rss_kb,
+            len(candidates),
+            stopped_count,
+            json.dumps(
+                {
+                    "planned": [trim_item_summary(item) for item in planned],
+                    "skipped": [
+                        {
+                            "reason": item.get("reason"),
+                            "workspace_index": (item.get("workspace") or {}).get("workspace_index"),
+                            "workspace_title": (item.get("workspace") or {}).get("workspace_title"),
+                        }
+                        for item in skipped[:25]
+                    ],
+                },
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+        ),
+    )
+
+
+def stop_trim_item(item: dict[str, Any], method: str) -> bool:
+    workspace = item["workspace"]
+    workspace_target = workspace.get("workspace_ref") or workspace.get("workspace_id")
+    surface_target = workspace.get("surface_ref") or workspace.get("surface_id")
+    if not workspace_target or not surface_target:
+        return False
+    if method == "ctrl-c":
+        return run_cmux(["send-key", "--workspace", str(workspace_target), "--surface", str(surface_target), "ctrl+c"], timeout=5.0) is not None
+    return run_cmux(["respawn-pane", "--workspace", str(workspace_target), "--surface", str(surface_target)], timeout=5.0) is not None
+
+
+def print_trim_report(
+    *,
+    args: argparse.Namespace,
+    total_rss_kb: int,
+    target_rss_kb: int,
+    projected_rss_kb: int,
+    candidates: list[dict[str, Any]],
+    planned: list[dict[str, Any]],
+    statuses: list[str],
+) -> None:
+    action = "stopped" if args.execute else "would stop"
+    print(
+        f"trim: total={format_mb(total_rss_kb)} target={format_mb(target_rss_kb)} "
+        f"projected={format_mb(projected_rss_kb)} candidates={len(candidates)} planned={len(planned)}"
+    )
+    if not planned:
+        if total_rss_kb <= target_rss_kb and not args.force:
+            print("trim: current sampled total is under the target.")
+        else:
+            print("trim: no recoverable old sessions matched the trim rules.")
+        return
+    for idx, item in enumerate(planned, start=1):
+        workspace = item["workspace"]
+        selected = item["selected"]
+        status = statuses[idx - 1] if idx - 1 < len(statuses) else action
+        title = workspace.get("workspace_title") or "(no title)"
+        print(
+            f"{idx}. {status}\t{format_mb(item.get('rss_kb'))}\tage={format_age(item.get('age_seconds') or 0)}\t"
+            f"{selected.get('tool')}\tsession={selected.get('session_id')}\tlast={selected.get('last_seen')}\t"
+            f"{workspace.get('workspace_ref') or workspace.get('workspace_id')}\t"
+            f"{workspace.get('surface_ref') or workspace.get('surface_id')}\t{title}"
+        )
+    if not args.execute:
+        print("trim: dry run only. Add --execute to stop these agents and leave the tabs ready for cmr.")
+
+
+def cmd_trim(args: argparse.Namespace) -> int:
+    if args.limit < 1:
+        print("trim: --limit must be at least 1")
+        return 2
+    with connect_db() as con:
+        if args.no_snapshot:
+            samples = latest_memory_samples(con)
+        else:
+            rows = tree_workspaces()
+            insert_workspace_observations(con, args.source, rows)
+            samples = record_memory_snapshot(con, args.source, rows, force=True)
+        total_rss_kb, target_rss_kb, candidates, skipped = trim_candidate_rows(con, samples, args)
+        planned, projected_rss_kb = plan_trim(args, total_rss_kb, target_rss_kb, candidates)
+        statuses: list[str] = []
+        stopped_count = 0
+        if args.execute:
+            for item in planned:
+                ok = stop_trim_item(item, args.method)
+                statuses.append("stopped" if ok else "failed")
+                if ok:
+                    stopped_count += 1
+        log_trim(
+            con,
+            action="trim-execute" if args.execute else "trim-dry-run",
+            status="executed" if args.execute else "dry-run",
+            method=args.method,
+            total_rss_kb=total_rss_kb,
+            target_rss_kb=target_rss_kb,
+            projected_rss_kb=projected_rss_kb,
+            candidates=candidates,
+            planned=planned,
+            stopped_count=stopped_count,
+            skipped=skipped,
+        )
+        export_latest(con)
+        con.commit()
+    print_trim_report(
+        args=args,
+        total_rss_kb=total_rss_kb,
+        target_rss_kb=target_rss_kb,
+        projected_rss_kb=projected_rss_kb,
+        candidates=candidates,
+        planned=planned,
+        statuses=statuses,
+    )
+    return 0
 
 
 def cmd_recover(args: argparse.Namespace) -> int:
@@ -1315,6 +1590,19 @@ def build_parser() -> argparse.ArgumentParser:
     memory_list.add_argument("--limit", type=int)
     memory_list.add_argument("--quiet", action="store_true")
     memory_list.set_defaults(func=cmd_memory_list)
+
+    trim = sub.add_parser("trim")
+    trim.add_argument("--target-gb", type=float, default=30.0)
+    trim.add_argument("--min-mb", type=float, default=128.0)
+    trim.add_argument("--min-age", default="30m")
+    trim.add_argument("--limit", type=int, default=10)
+    trim.add_argument("--method", choices=["respawn", "ctrl-c"], default="respawn")
+    trim.add_argument("--execute", action="store_true")
+    trim.add_argument("--force", action="store_true")
+    trim.add_argument("--include-active", action="store_true")
+    trim.add_argument("--no-snapshot", action="store_true")
+    trim.add_argument("--source", default="trim")
+    trim.set_defaults(func=cmd_trim)
 
     recover = sub.add_parser("recover")
     recover.add_argument("choice", nargs="?", type=int)

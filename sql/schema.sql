@@ -157,3 +157,20 @@ CREATE TABLE IF NOT EXISTS memory_process_samples (
 
 CREATE INDEX IF NOT EXISTS idx_memory_process_samples_sample
   ON memory_process_samples(sample_id);
+
+CREATE TABLE IF NOT EXISTS trim_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  observed_at TEXT NOT NULL,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL,
+  method TEXT NOT NULL,
+  total_rss_kb INTEGER NOT NULL DEFAULT 0,
+  target_rss_kb INTEGER NOT NULL DEFAULT 0,
+  projected_rss_kb INTEGER NOT NULL DEFAULT 0,
+  candidate_count INTEGER NOT NULL DEFAULT 0,
+  stopped_count INTEGER NOT NULL DEFAULT 0,
+  details_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_trim_events_observed
+  ON trim_events(observed_at DESC);
