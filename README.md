@@ -1,13 +1,49 @@
 # cmux-agent-recovery
 
-Local crash recovery for Claude Code and Codex sessions running inside CMUX.
+Local crash recovery for Claude Code and Codex sessions running inside [CMUX](https://github.com/manaflow-ai/cmux).
 
-The goal is simple:
+CMUX can restore workspace layout after a relaunch, app update, macOS reboot, or crash, but the live Claude Code/Codex processes are gone. This tool records enough local metadata to resume the right agent session in the right restored workspace.
+
+## What It Does
 
 - Save session metadata automatically on every agent turn.
 - After CMUX restarts, recover one workspace at a time with `cmr`.
 - Never start a fresh `claude` or `codex` session when a resume ID is missing.
 - Never bulk-start every old agent after a crash.
+- Log per-workspace memory and CPU telemetry so runaway sessions are easier to find.
+- Safely stop older/heavy agents while keeping the CMUX tabs ready to recover later.
+
+This is a stopgap, not a replacement for native CMUX session persistence. It does not keep killed processes alive. It makes Claude Code/Codex recovery fast and explicit using their own resume mechanisms.
+
+## Quick Start
+
+```sh
+git clone https://github.com/Lumiwealth/cmux-agent-recovery.git
+cd cmux-agent-recovery
+```
+
+Add the repo's `bin/` directory to your `PATH`, then wire `hooks/agent-record.sh` into Claude Code and Codex hook events.
+
+The important hook command shape is:
+
+```sh
+/path/to/cmux-agent-recovery/hooks/agent-record.sh claude UserPromptSubmit
+/path/to/cmux-agent-recovery/hooks/agent-record.sh codex UserPromptSubmit
+```
+
+Optional short command:
+
+```sh
+cmr() {
+  "/path/to/cmux-agent-recovery/bin/cmr" "$@"
+}
+```
+
+Then, inside a restored CMUX workspace:
+
+```sh
+cmr
+```
 
 ## Commands
 
@@ -115,22 +151,22 @@ Treat the database as private local state. Session IDs, transcript paths, and wo
 - Restore is one workspace at a time by default.
 - `trim` only stops workspaces with a recoverable session ID, skips the active workspace by default, and runs as a dry run unless `--execute` is passed.
 
-## Install
+## Hook Locations
 
-The hooks are wired from:
+Typical local hook wiring lives in:
 
 - `~/.claude/settings.json`
 - `~/.codex/hooks.json`
 - `~/.zshrc`
 
-The short shell command is a zsh function:
-
-```sh
-cmr() {
-  "/path/to/cmux-agent-recovery/bin/cmr" "$@"
-}
-```
+Hook formats change over time, so keep the installed hook small: pass the tool name and event into `hooks/agent-record.sh`, and keep hook stdout silent.
 
 ## Notes
 
 CMUX currently restores layout and metadata after relaunch, but it does not restore live process state. This tool fills that gap for Claude Code and Codex by storing resume metadata outside CMUX.
+
+## Related CMUX Issues
+
+- [Stable agent session recovery after CMUX crash or relaunch](https://github.com/manaflow-ai/cmux/issues/3342)
+- [Persist session manifest and re-attach live agent processes after daemon/app restart](https://github.com/manaflow-ai/cmux/issues/3322)
+- [Show per-workspace/session memory and CPU usage in sidebar](https://github.com/manaflow-ai/cmux/issues/3130)
