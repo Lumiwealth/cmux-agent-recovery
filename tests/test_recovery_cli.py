@@ -110,6 +110,7 @@ class RecoveryCliTests(unittest.TestCase):
             "CMUX_BIN": str(self.fake_cmux),
             "CMUX_RECOVERY_DB": str(self.db),
             "CMUX_RESTORE_CWD": str(self.restore_cwd),
+            "CMUX_RECOVERY_DISABLE_MEMORY": "1",
         }
 
     def tearDown(self) -> None:
@@ -268,6 +269,29 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertIn("codex -C", recovered.stdout)
         self.assertIn("codex-release-session", recovered.stdout)
+
+    def test_memory_snapshot_aggregates_tty_process_tree(self) -> None:
+        self.env.pop("CMUX_RECOVERY_DISABLE_MEMORY", None)
+        self.env["CMUX_RECOVERY_PS_JSON"] = json.dumps(
+            [
+                {"pid": 10, "ppid": 1, "pgid": 10, "tty": "ttys999", "rss_kb": 1000, "pmem": 0.1, "command_name": "zsh"},
+                {"pid": 11, "ppid": 10, "pgid": 10, "tty": "ttys999", "rss_kb": 2000, "pmem": 0.2, "command_name": "codex"},
+                {"pid": 12, "ppid": 11, "pgid": 10, "tty": None, "rss_kb": 3000, "pmem": 0.3, "command_name": "mcp-server"},
+                {"pid": 20, "ppid": 1, "pgid": 20, "tty": "ttys123", "rss_kb": 5000, "pmem": 0.5, "command_name": "other"},
+            ]
+        )
+
+        snap = self.run_cli("memory-snapshot", "--quiet")
+        self.assertEqual(snap.returncode, 0, snap.stderr)
+
+        with sqlite3.connect(self.db) as con:
+            row = con.execute(
+                "SELECT process_count, total_rss_kb, total_pmem, top_processes_json FROM memory_workspace_samples"
+            ).fetchone()
+            self.assertEqual(row[0], 3)
+            self.assertEqual(row[1], 6000)
+            self.assertAlmostEqual(row[2], 0.6)
+            self.assertIn("mcp-server", row[3])
 
 
 if __name__ == "__main__":

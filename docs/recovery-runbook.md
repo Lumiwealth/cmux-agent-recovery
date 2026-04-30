@@ -66,6 +66,28 @@ Claude and Codex write on:
 
 This means renames and directory changes get refreshed during normal use.
 
+## Memory Telemetry
+
+Every hook-triggered record also samples workspace memory usage. The sampler maps CMUX workspace ttys to their attached process trees, sums RSS, and stores top process names. It does not store full command lines by default because those can include secrets.
+
+Manual snapshot:
+
+```sh
+cmux-recovery memory-snapshot
+```
+
+Largest workspaces in a recent window:
+
+```sh
+cmux-recovery memory-top --since 6h
+```
+
+Disable automatic sampling:
+
+```sh
+export CMUX_RECOVERY_DISABLE_MEMORY=1
+```
+
 ## Database
 
 Default database:

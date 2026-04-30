@@ -335,6 +335,160 @@ def insert_workspace_observations(con: sqlite3.Connection, source: str, rows: li
         )
 
 
+def memory_enabled() -> bool:
+    value = os.environ.get("CMUX_RECOVERY_DISABLE_MEMORY", "").strip().lower()
+    return value not in {"1", "true", "yes", "on"}
+
+
+def collect_processes() -> list[dict[str, Any]]:
+    fixture = os.environ.get("CMUX_RECOVERY_PS_JSON")
+    if fixture:
+        try:
+            raw = json.loads(fixture)
+            return [dict(row) for row in raw if isinstance(row, dict)]
+        except json.JSONDecodeError:
+            return []
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,tty=,rss=,pmem=,comm="],
+            text=True,
+            capture_output=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 6)
+        if len(parts) < 7:
+            continue
+        pid, ppid, pgid, tty, rss, pmem, command = parts
+        rows.append(
+            {
+                "pid": int_or_none(pid),
+                "ppid": int_or_none(ppid),
+                "pgid": int_or_none(pgid),
+                "tty": None if tty == "??" else tty,
+                "rss_kb": int_or_none(rss) or 0,
+                "pmem": float(pmem) if re.match(r"^\d+(?:\.\d+)?$", pmem) else 0.0,
+                "command_name": Path(command).name,
+            }
+        )
+    return [row for row in rows if row.get("pid") is not None]
+
+
+def process_tree_for_tty(processes: list[dict[str, Any]], tty: str | None) -> list[dict[str, Any]]:
+    if not tty:
+        return []
+    by_pid = {int(row["pid"]): row for row in processes if row.get("pid") is not None}
+    children: dict[int, list[int]] = {}
+    for row in processes:
+        pid = row.get("pid")
+        ppid = row.get("ppid")
+        if pid is None or ppid is None:
+            continue
+        children.setdefault(int(ppid), []).append(int(pid))
+    roots = [int(row["pid"]) for row in processes if row.get("tty") == tty and row.get("pid") is not None]
+    seen: set[int] = set()
+    out: list[dict[str, Any]] = []
+    stack = [(pid, 0, True) for pid in roots]
+    while stack:
+        pid, depth, is_tty_attached = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        row = by_pid.get(pid)
+        if not row:
+            continue
+        out.append({**row, "depth": depth, "is_tty_attached": 1 if is_tty_attached else 0})
+        for child in children.get(pid, []):
+            stack.append((child, depth + 1, False))
+    out.sort(key=lambda row: (int(row.get("rss_kb") or 0), int(row.get("pid") or 0)), reverse=True)
+    return out
+
+
+def record_memory_snapshot(
+    con: sqlite3.Connection,
+    source: str,
+    rows: list[dict[str, Any]] | None = None,
+    *,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    if not force and not memory_enabled():
+        return []
+    observed_at = utc_now()
+    workspaces = rows if rows is not None else tree_workspaces()
+    processes = collect_processes()
+    samples: list[dict[str, Any]] = []
+    for ws in workspaces:
+        tree = process_tree_for_tty(processes, ws.get("tty"))
+        total_rss = sum(int(row.get("rss_kb") or 0) for row in tree)
+        total_pmem = sum(float(row.get("pmem") or 0.0) for row in tree)
+        top = [
+            {
+                "pid": row.get("pid"),
+                "name": row.get("command_name"),
+                "rss_kb": row.get("rss_kb"),
+                "pmem": row.get("pmem"),
+            }
+            for row in tree[:8]
+        ]
+        cursor = con.execute(
+            """
+            INSERT INTO memory_workspace_samples (
+              observed_at, source, window_id, window_ref, workspace_id, workspace_ref,
+              workspace_index, workspace_title, normalized_title, surface_id, surface_ref,
+              tty, process_count, total_rss_kb, total_pmem, top_processes_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                observed_at,
+                source,
+                ws.get("window_id"),
+                ws.get("window_ref"),
+                ws.get("workspace_id"),
+                ws.get("workspace_ref"),
+                ws.get("workspace_index"),
+                ws.get("workspace_title"),
+                ws.get("normalized_title"),
+                ws.get("surface_id"),
+                ws.get("surface_ref"),
+                ws.get("tty"),
+                len(tree),
+                total_rss,
+                total_pmem,
+                json.dumps(top, separators=(",", ":"), ensure_ascii=False),
+            ),
+        )
+        sample_id = int(cursor.lastrowid)
+        for row in tree:
+            con.execute(
+                """
+                INSERT INTO memory_process_samples (
+                  sample_id, pid, ppid, pgid, tty, rss_kb, pmem, command_name,
+                  depth, is_tty_attached
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sample_id,
+                    row.get("pid"),
+                    row.get("ppid"),
+                    row.get("pgid"),
+                    row.get("tty"),
+                    int(row.get("rss_kb") or 0),
+                    float(row.get("pmem") or 0.0),
+                    row.get("command_name"),
+                    row.get("depth"),
+                    int(row.get("is_tty_attached") or 0),
+                ),
+            )
+        samples.append({**ws, "sample_id": sample_id, "process_count": len(tree), "total_rss_kb": total_rss, "total_pmem": total_pmem, "top_processes": top})
+    return samples
+
+
 def event_from_payload(payload: dict[str, Any], args: argparse.Namespace, workspace: dict[str, Any]) -> dict[str, Any]:
     tool = args.tool
     event = args.event or payload.get("hook_event_name") or "unknown"
@@ -476,8 +630,10 @@ def cmd_record(args: argparse.Namespace) -> int:
     except json.JSONDecodeError:
         payload = {"raw": raw}
     with connect_db() as con:
+        rows = tree_workspaces()
         workspace = current_workspace()
-        insert_workspace_observations(con, f"{args.tool}-record")
+        insert_workspace_observations(con, f"{args.tool}-record", rows)
+        record_memory_snapshot(con, f"{args.tool}-record", rows)
         row = event_from_payload(payload, args, workspace)
         upsert_event(con, row)
         export_latest(con)
@@ -492,8 +648,10 @@ def cmd_record_resume(args: argparse.Namespace) -> int:
     }
     args.source = args.source or f"{args.tool}-zsh-wrapper"
     with connect_db() as con:
+        rows = tree_workspaces()
         workspace = current_workspace()
-        insert_workspace_observations(con, f"{args.tool}-resume")
+        insert_workspace_observations(con, f"{args.tool}-resume", rows)
+        record_memory_snapshot(con, f"{args.tool}-resume", rows)
         row = event_from_payload(payload, args, workspace)
         upsert_event(con, row)
         export_latest(con)
@@ -504,9 +662,103 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     with connect_db() as con:
         rows = tree_workspaces()
         insert_workspace_observations(con, args.source, rows)
+        record_memory_snapshot(con, args.source, rows)
         export_latest(con)
     if not args.quiet:
         print(f"snapshot: {len(rows)} workspaces")
+    return 0
+
+
+def format_mb(kb: int | float | None) -> str:
+    return f"{(float(kb or 0) / 1024):.1f} MB"
+
+
+def parse_duration(value: str) -> float:
+    text = value.strip().lower()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text)
+    if not match:
+        raise argparse.ArgumentTypeError("duration must look like 30m, 6h, or 7d")
+    amount = float(match.group(1))
+    unit = match.group(2) or "s"
+    scale = {"s": 1, "m": 60, "h": 60 * 60, "d": 24 * 60 * 60}[unit]
+    return amount * scale
+
+
+def cmd_memory_snapshot(args: argparse.Namespace) -> int:
+    with connect_db() as con:
+        rows = tree_workspaces()
+        insert_workspace_observations(con, args.source, rows)
+        samples = record_memory_snapshot(con, args.source, rows, force=True)
+        export_latest(con)
+    if not args.quiet:
+        print(f"memory-snapshot: {len(samples)} workspaces")
+        for item in sorted(samples, key=lambda row: int(row.get("total_rss_kb") or 0), reverse=True)[: args.limit]:
+            print(
+                f"{item.get('workspace_index', '')}\t{format_mb(item.get('total_rss_kb'))}\t"
+                f"{item.get('process_count', 0)} procs\t{item.get('workspace_title') or ''}"
+            )
+    return 0
+
+
+def cmd_memory_top(args: argparse.Namespace) -> int:
+    since_seconds = parse_duration(args.since)
+    since = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=since_seconds)
+    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    with connect_db() as con:
+        rows = con.execute(
+            """
+            SELECT *
+            FROM memory_workspace_samples
+            WHERE observed_at >= ?
+            ORDER BY observed_at ASC
+            """,
+            (since,),
+        ).fetchall()
+    for row in rows:
+        key = (
+            row["normalized_title"] or "",
+            row["workspace_id"] or "",
+            row["surface_id"] or "",
+        )
+        item = groups.setdefault(
+            key,
+            {
+                "workspace_index": row["workspace_index"],
+                "workspace_title": row["workspace_title"],
+                "latest_at": row["observed_at"],
+                "latest_rss_kb": row["total_rss_kb"],
+                "max_rss_kb": row["total_rss_kb"],
+                "samples": 0,
+                "top_processes_json": row["top_processes_json"],
+            },
+        )
+        item["samples"] += 1
+        if parse_time(row["observed_at"]) >= parse_time(item["latest_at"]):
+            item["workspace_index"] = row["workspace_index"]
+            item["workspace_title"] = row["workspace_title"]
+            item["latest_at"] = row["observed_at"]
+            item["latest_rss_kb"] = row["total_rss_kb"]
+            item["top_processes_json"] = row["top_processes_json"]
+        item["max_rss_kb"] = max(int(item["max_rss_kb"] or 0), int(row["total_rss_kb"] or 0))
+    ranked = sorted(groups.values(), key=lambda item: int(item.get("max_rss_kb") or 0), reverse=True)
+    for item in ranked[: args.limit]:
+        top_names = ""
+        try:
+            top = json.loads(item.get("top_processes_json") or "[]")
+            top_names = ", ".join(
+                f"{row.get('name')} {format_mb(row.get('rss_kb'))}"
+                for row in top[:3]
+                if row.get("name")
+            )
+        except json.JSONDecodeError:
+            top_names = ""
+        print(
+            f"{item.get('workspace_index', '')}\tlatest={format_mb(item.get('latest_rss_kb'))}\t"
+            f"max={format_mb(item.get('max_rss_kb'))}\tsamples={item.get('samples')}\t"
+            f"{item.get('workspace_title') or ''}\t{top_names}"
+        )
     return 0
 
 
@@ -647,6 +899,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
     with connect_db() as con:
         rows = tree_workspaces()
         insert_workspace_observations(con, "recover", rows)
+        record_memory_snapshot(con, "recover", rows)
         current = current_workspace()
         if not current.get("normalized_title"):
             current["normalized_title"] = normalize_title(current.get("workspace_title"))
@@ -685,6 +938,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     with connect_db() as con:
         rows = tree_workspaces()
         insert_workspace_observations(con, "verify", rows)
+        record_memory_snapshot(con, "verify", rows)
         chooser_args = argparse.Namespace(choice=None)
         for ws in rows:
             candidates = load_candidates(con, ws)
@@ -991,6 +1245,17 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--source", default="manual-snapshot")
     snapshot.add_argument("--quiet", action="store_true")
     snapshot.set_defaults(func=cmd_snapshot)
+
+    memory_snapshot = sub.add_parser("memory-snapshot")
+    memory_snapshot.add_argument("--source", default="manual-memory-snapshot")
+    memory_snapshot.add_argument("--quiet", action="store_true")
+    memory_snapshot.add_argument("--limit", type=int, default=10)
+    memory_snapshot.set_defaults(func=cmd_memory_snapshot)
+
+    memory_top = sub.add_parser("memory-top")
+    memory_top.add_argument("--since", default="6h")
+    memory_top.add_argument("--limit", type=int, default=15)
+    memory_top.set_defaults(func=cmd_memory_top)
 
     recover = sub.add_parser("recover")
     recover.add_argument("choice", nargs="?", type=int)

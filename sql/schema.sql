@@ -113,3 +113,45 @@ CREATE TABLE IF NOT EXISTS restore_events (
   details_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS memory_workspace_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  observed_at TEXT NOT NULL,
+  source TEXT NOT NULL,
+  window_id TEXT,
+  window_ref TEXT,
+  workspace_id TEXT,
+  workspace_ref TEXT,
+  workspace_index INTEGER,
+  workspace_title TEXT,
+  normalized_title TEXT,
+  surface_id TEXT,
+  surface_ref TEXT,
+  tty TEXT,
+  process_count INTEGER NOT NULL DEFAULT 0,
+  total_rss_kb INTEGER NOT NULL DEFAULT 0,
+  total_pmem REAL NOT NULL DEFAULT 0,
+  top_processes_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_workspace_samples_observed
+  ON memory_workspace_samples(observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memory_workspace_samples_workspace
+  ON memory_workspace_samples(normalized_title, workspace_id, observed_at DESC);
+
+CREATE TABLE IF NOT EXISTS memory_process_samples (
+  sample_id INTEGER NOT NULL,
+  pid INTEGER NOT NULL,
+  ppid INTEGER,
+  pgid INTEGER,
+  tty TEXT,
+  rss_kb INTEGER NOT NULL DEFAULT 0,
+  pmem REAL NOT NULL DEFAULT 0,
+  command_name TEXT,
+  depth INTEGER,
+  is_tty_attached INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(sample_id) REFERENCES memory_workspace_samples(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_process_samples_sample
+  ON memory_process_samples(sample_id);
