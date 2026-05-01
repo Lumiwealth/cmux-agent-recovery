@@ -261,6 +261,7 @@ def tree_workspaces() -> list[dict[str, Any]]:
                     "workspace_ref": clean(ws.get("ref")),
                     "workspace_index": workspace_index,
                     "workspace_title": title,
+                    "workspace_description": clean(ws.get("description")),
                     "normalized_title": normalize_title(title),
                     "current_directory": clean((saved_match or {}).get("current_directory")),
                     "process_title": clean((saved_match or {}).get("process_title")),
@@ -836,6 +837,88 @@ def cmd_memory_list(args: argparse.Namespace) -> int:
             f"{row['process_count']} procs\t{row['workspace_title'] or ''}"
         )
     return 0
+
+
+SIDEBAR_METRIC_PREFIX = "cmux: "
+
+
+def strip_managed_sidebar_metric(description: str | None) -> str:
+    lines = (description or "").splitlines()
+    return "\n".join(line for line in lines if not line.startswith(SIDEBAR_METRIC_PREFIX)).strip()
+
+
+def sidebar_metric_line(sample: dict[str, Any]) -> str:
+    rss_mb = float(sample.get("total_rss_kb") or 0) / 1024.0
+    cpu = float(sample.get("total_pcpu") or 0.0)
+    procs = int(sample.get("process_count") or 0)
+    if rss_mb >= 1024:
+        rss = f"{rss_mb / 1024.0:.1f}GB"
+    else:
+        rss = f"{rss_mb:.0f}MB"
+    return f"{SIDEBAR_METRIC_PREFIX}rss={rss} cpu={cpu:.1f}% procs={procs}"
+
+
+def build_sidebar_description(sample: dict[str, Any], clear: bool = False) -> str:
+    original = strip_managed_sidebar_metric(sample.get("workspace_description"))
+    if clear:
+        return original
+    metric = sidebar_metric_line(sample)
+    return f"{metric}\n{original}" if original else metric
+
+
+def set_workspace_description(workspace: str, description: str) -> bool:
+    if description.strip():
+        return run_cmux(
+            [
+                "workspace-action",
+                "--workspace",
+                workspace,
+                "--action",
+                "set-description",
+                "--description",
+                description,
+            ],
+            timeout=5.0,
+        ) is not None
+    return run_cmux(
+        ["workspace-action", "--workspace", workspace, "--action", "clear-description"],
+        timeout=5.0,
+    ) is not None
+
+
+def cmd_sidebar_metrics(args: argparse.Namespace) -> int:
+    with connect_db() as con:
+        rows = tree_workspaces()
+        insert_workspace_observations(con, args.source, rows)
+        samples = record_memory_snapshot(con, args.source, rows, force=True)
+        export_latest(con)
+        con.commit()
+
+    samples.sort(key=lambda item: (item.get("workspace_index") is None, item.get("workspace_index") or 0))
+    changed = 0
+    failed = 0
+    for item in samples:
+        workspace = item.get("workspace_ref") or item.get("workspace_id")
+        if not workspace:
+            failed += 1
+            continue
+        next_description = build_sidebar_description(item, clear=args.clear)
+        current_description = item.get("workspace_description") or ""
+        will_change = next_description != current_description
+        if will_change:
+            changed += 1
+        if args.execute and will_change and not set_workspace_description(str(workspace), next_description):
+            failed += 1
+
+    action = "cleared" if args.clear else "updated"
+    mode = "executed" if args.execute else "dry-run"
+    print(f"sidebar-metrics: {mode} {action}={changed} failed={failed} workspaces={len(samples)}")
+    for item in samples[: args.limit]:
+        title = item.get("workspace_title") or ""
+        print(f"{item.get('workspace_index', '')}\t{sidebar_metric_line(item)}\t{title}")
+    if not args.execute:
+        print("sidebar-metrics: dry run only. Add --execute to write CMUX workspace descriptions.")
+    return 0 if failed == 0 else 1
 
 
 def latest_memory_samples(con: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -1590,6 +1673,13 @@ def build_parser() -> argparse.ArgumentParser:
     memory_list.add_argument("--limit", type=int)
     memory_list.add_argument("--quiet", action="store_true")
     memory_list.set_defaults(func=cmd_memory_list)
+
+    sidebar_metrics = sub.add_parser("sidebar-metrics")
+    sidebar_metrics.add_argument("--execute", action="store_true")
+    sidebar_metrics.add_argument("--clear", action="store_true")
+    sidebar_metrics.add_argument("--limit", type=int, default=12)
+    sidebar_metrics.add_argument("--source", default="sidebar-metrics")
+    sidebar_metrics.set_defaults(func=cmd_sidebar_metrics)
 
     trim = sub.add_parser("trim")
     trim.add_argument("--target-gb", type=float, default=30.0)

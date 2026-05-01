@@ -83,6 +83,32 @@ cmux-recovery memory-list
 cmux-recovery memory-top --since 6h
 ```
 
+## Sidebar Metrics
+
+CMUX renders workspace descriptions in the sidebar and exposes them through the CLI. The recovery tool can use that as a lightweight, no-fork display surface for memory metrics:
+
+```sh
+cmux-recovery sidebar-metrics
+```
+
+Default mode is a dry run. To write the metrics into each workspace description:
+
+```sh
+cmux-recovery sidebar-metrics --execute
+```
+
+The managed line looks like:
+
+```text
+cmux: rss=1.2GB cpu=3.4% procs=18
+```
+
+This command does not rename workspaces, so it does not interfere with recovery title matching. It preserves existing description text and only replaces prior managed `cmux:` metric lines. Clear managed metrics:
+
+```sh
+cmux-recovery sidebar-metrics --clear --execute
+```
+
 ## Reducing Memory Pressure
 
 Use `trim` when too many recovered agents are running at once:

@@ -94,6 +94,16 @@ cmux-recovery memory-list
 cmux-recovery memory-top --since 6h
 ```
 
+Show memory and CPU directly in the CMUX sidebar by writing a managed line to each workspace description:
+
+```sh
+cmux-recovery sidebar-metrics
+cmux-recovery sidebar-metrics --execute
+cmux-recovery sidebar-metrics --clear --execute
+```
+
+This does not change workspace titles. It preserves any existing description text except prior managed `cmux:` metric lines.
+
 Plan a safe memory trim:
 
 ```sh

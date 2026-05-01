@@ -101,6 +101,8 @@ class RecoveryCliTests(unittest.TestCase):
                     print("OK Respawned pane")
                 elif "send-key" in args:
                     print("OK Sent key")
+                elif "workspace-action" in args:
+                    print("OK Workspace action")
                 else:
                     print("unknown fake cmux command", args, file=sys.stderr)
                     raise SystemExit(1)
@@ -303,6 +305,30 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("Release Notes", listed.stdout)
         self.assertIn("5.9 MB", listed.stdout)
         self.assertIn("cpu=4.0%", listed.stdout)
+
+    def test_sidebar_metrics_updates_workspace_descriptions_when_executed(self) -> None:
+        self.env.pop("CMUX_RECOVERY_DISABLE_MEMORY", None)
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["description"] = "Keep this note"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+        self.env["CMUX_RECOVERY_PS_JSON"] = json.dumps(
+            [
+                {"pid": 10, "ppid": 1, "pgid": 10, "tty": "ttys999", "rss_kb": 2048, "pmem": 0.2, "pcpu": 1.5, "command_name": "zsh"},
+            ]
+        )
+
+        dry = self.run_cli("sidebar-metrics")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("dry-run", dry.stdout)
+        self.assertIn("cmux: rss=2MB cpu=1.5% procs=1", dry.stdout)
+
+        executed = self.run_cli("sidebar-metrics", "--execute")
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        self.assertIn("executed", executed.stdout)
+
+        cleared = self.run_cli("sidebar-metrics", "--clear", "--execute")
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertIn("cleared", cleared.stdout)
 
     def test_trim_only_stops_recoverable_sessions_when_executed(self) -> None:
         self.env.pop("CMUX_RECOVERY_DISABLE_MEMORY", None)
