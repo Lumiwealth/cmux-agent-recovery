@@ -66,6 +66,38 @@ def same_path(left: str | None, right: str | None) -> bool:
     return str(Path(left).expanduser()) == str(Path(right).expanduser())
 
 
+def path_variants(value: str | Path | None) -> list[Path]:
+    variants: list[Path] = []
+    if not value:
+        return variants
+    raw = Path(value).expanduser()
+    variants.append(raw)
+    parts = raw.parts
+    old_root = ("/", "Users", "robertgrzesik", "Documents", "Development")
+    if parts[: len(old_root)] == old_root:
+        variants.append(Path("/Users/robertgrzesik/Development", *parts[len(old_root) :]))
+    new_root = ("/", "Users", "robertgrzesik", "Development")
+    if parts[: len(new_root)] == new_root:
+        variants.append(Path("/Users/robertgrzesik/Documents/Development", *parts[len(new_root) :]))
+    seen: set[str] = set()
+    out: list[Path] = []
+    for item in variants:
+        key = str(item)
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def claude_project_slug(path: Path) -> str:
+    parts = path.expanduser().parts
+    if not parts:
+        return ""
+    if parts[0] == "/":
+        return "-" + "-".join(parts[1:])
+    return "-".join(parts)
+
+
 def file_observed_at(path: Path) -> str:
     try:
         timestamp = path.stat().st_mtime
@@ -963,6 +995,8 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
     workspace_ref_match = raw_workspace_ref_match and ordinal_match_allowed
     index_match = raw_index_match and ordinal_match_allowed
     cwd_match = same_path(current.get("current_directory"), candidate["cwd"])
+    resume_cwd = candidate_cwd(dict(candidate))
+    resume_cwd_match = same_path(current.get("current_directory"), str(resume_cwd))
 
     # Title text is matched literally. User-defined title markers may make a
     # title more unique, but they are not interpreted as tool metadata.
@@ -979,6 +1013,8 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
         score += 75
     if cwd_match:
         score += 25
+    if resume_cwd_match and not cwd_match:
+        score += 35
     if index_match:
         score += 8
     age = max(0.0, time.time() - parse_time(candidate["last_seen"]))
@@ -1010,6 +1046,23 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
         item = dict(row)
         item["score"] = score
         item["title_match"] = bool(current.get("normalized_title") and current.get("normalized_title") == item.get("normalized_title"))
+        item["surface_match"] = bool(current.get("surface_id") and current.get("surface_id") == item.get("surface_id"))
+        item["workspace_id_match"] = bool(current.get("workspace_id") and current.get("workspace_id") == item.get("workspace_id"))
+        item["workspace_ref_match"] = bool(
+            current.get("workspace_ref")
+            and current.get("workspace_ref") == item.get("workspace_ref")
+            and (not current.get("normalized_title") or item["title_match"])
+        )
+        item["index_match"] = bool(
+            current.get("workspace_index") is not None
+            and item.get("workspace_index") is not None
+            and current.get("workspace_index") == item.get("workspace_index")
+            and (not current.get("normalized_title") or item["title_match"])
+        )
+        item["cwd_match"] = same_path(current.get("current_directory"), item.get("cwd"))
+        item["resume_cwd"] = str(candidate_cwd(item))
+        item["resume_cwd_match"] = same_path(current.get("current_directory"), item.get("resume_cwd"))
+        item.update(transcript_info(item.get("transcript_path")))
         item["command"] = resume_command(item)
         candidates.append(item)
     candidates.sort(key=lambda item: (item["score"], parse_time(item.get("last_seen"))), reverse=True)
@@ -1017,17 +1070,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
 
 
 def usable_cwd(value: str | None) -> Path:
-    candidates: list[Path] = []
-    if value:
-        raw = Path(value).expanduser()
-        candidates.append(raw)
-        try:
-            parts = raw.parts
-            old_root = ("/", "Users", "robertgrzesik", "Documents", "Development")
-            if parts[: len(old_root)] == old_root:
-                candidates.append(Path("/Users/robertgrzesik/Development", *parts[len(old_root) :]))
-        except RuntimeError:
-            pass
+    candidates: list[Path] = path_variants(value)
     candidates.append(DEFAULT_RESTORE_CWD)
     for candidate in candidates:
         if candidate.exists() and candidate.is_dir():
@@ -1035,8 +1078,73 @@ def usable_cwd(value: str | None) -> Path:
     return DEFAULT_RESTORE_CWD
 
 
+def claude_project_cwd(candidate: dict[str, Any]) -> Path | None:
+    transcript_path = candidate.get("transcript_path")
+    if not transcript_path:
+        return None
+    path = Path(str(transcript_path)).expanduser()
+    if len(path.parts) < 4 or path.parent.parent.name != "projects" or path.parent.parent.parent.name != ".claude":
+        return None
+    slug = path.parent.name
+    search: list[Path] = []
+    for raw in [candidate.get("cwd"), DEFAULT_RESTORE_CWD]:
+        for variant in path_variants(raw):
+            search.append(variant)
+            search.extend(variant.parents)
+    seen: set[str] = set()
+    for item in search:
+        key = str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        if item.exists() and item.is_dir() and claude_project_slug(item) == slug:
+            return item
+    return None
+
+
+def candidate_cwd(candidate: dict[str, Any]) -> Path:
+    if candidate.get("tool") == "claude":
+        project_cwd = claude_project_cwd(candidate)
+        if project_cwd:
+            return project_cwd
+    return usable_cwd(candidate.get("cwd"))
+
+
+def transcript_info(value: str | None) -> dict[str, Any]:
+    info: dict[str, Any] = {"transcript_exists": False, "transcript_bytes": None, "first_user_prompt": None}
+    if not value:
+        return info
+    path = Path(value).expanduser()
+    try:
+        stat = path.stat()
+    except OSError:
+        return info
+    info["transcript_exists"] = True
+    info["transcript_bytes"] = stat.st_size
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "user":
+                    continue
+                message = obj.get("message")
+                content = message.get("content") if isinstance(message, dict) else obj.get("content")
+                if isinstance(content, list):
+                    content = " ".join(str(part.get("text") if isinstance(part, dict) else part) for part in content)
+                text = re.sub(r"\s+", " ", str(content or "")).strip()
+                if text:
+                    info["first_user_prompt"] = text[:220]
+                    break
+    except OSError:
+        pass
+    return info
+
+
 def resume_command(candidate: dict[str, Any]) -> str:
-    cwd = str(usable_cwd(candidate.get("cwd")))
+    cwd = str(candidate_cwd(candidate))
     sid = str(candidate["session_id"])
     if candidate["tool"] == "codex":
         return f"cd {shlex.quote(cwd)} && codex -C {shlex.quote(cwd)} resume {shlex.quote(sid)}"
@@ -1047,10 +1155,17 @@ def print_candidates(candidates: list[dict[str, Any]], limit: int = 8) -> None:
     for idx, item in enumerate(candidates[:limit], start=1):
         title = item.get("workspace_title") or "(no title)"
         cwd = item.get("cwd") or ""
+        resume_cwd = item.get("resume_cwd") or ""
+        size = ""
+        if item.get("transcript_bytes") is not None:
+            size = f" transcript={int(item['transcript_bytes']) / 1024 / 1024:.1f}MB"
+        prompt = item.get("first_user_prompt")
         print(
             f"{idx}. {item['tool']} score={item['score']} last={item.get('last_seen')} "
-            f"title={title!r} cwd={cwd}"
+            f"title={title!r} cwd={cwd} resume_cwd={resume_cwd}{size}"
         )
+        if prompt:
+            print(f"   first_user={prompt!r}")
 
 
 def log_restore(con: sqlite3.Connection, action: str, status: str, current: dict[str, Any], selected: dict[str, Any] | None, candidates: list[dict[str, Any]]) -> None:
@@ -1088,12 +1203,13 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
         return "missing", None
     top = candidates[0]
     second = candidates[1] if len(candidates) > 1 else None
+    strong_keys = ("surface_match", "workspace_id_match", "workspace_ref_match", "cwd_match", "resume_cwd_match", "index_match")
+    top_strong = any(top.get(key) for key in strong_keys)
+    second_title_match = bool(second and second.get("title_match"))
+    if top.get("title_match") and not top_strong and second_title_match:
+        return "ambiguous", None
     if top["score"] >= 75 and (second is None or top["score"] - second["score"] >= 20):
         return "selected", top
-    if top.get("title_match") and top["score"] >= 75 and second is not None and second.get("title_match"):
-        recency_gap = parse_time(top.get("last_seen")) - parse_time(second.get("last_seen"))
-        if recency_gap >= 5 * 60:
-            return "selected", top
     return "ambiguous", None
 
 
@@ -1357,7 +1473,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
         print(command)
         return 0
 
-    cwd = str(usable_cwd(selected.get("cwd")))
+    cwd = str(candidate_cwd(selected))
     os.chdir(cwd)
     if selected["tool"] == "codex":
         os.execvp("codex", ["codex", "-C", cwd, "resume", selected["session_id"]])

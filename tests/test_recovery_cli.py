@@ -166,6 +166,36 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn(f"cd {project_cwd}", recovered.stdout)
         self.assertIn("claude --resume claude-project-session", recovered.stdout)
 
+    def test_claude_resume_prefers_transcript_project_cwd(self) -> None:
+        child_cwd = self.restore_cwd / "botspot_node"
+        child_cwd.mkdir()
+        slug = "-" + "-".join(self.restore_cwd.parts[1:])
+        transcript = self.base / ".claude" / "projects" / slug / "claude-root-project-session.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            json.dumps({"type": "user", "message": {"content": "newsletter work in the root project"}}) + "\n",
+            encoding="utf-8",
+        )
+        recorded = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={
+                "session_id": "claude-root-project-session",
+                "cwd": str(child_cwd),
+                "transcript_path": str(transcript),
+            },
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn(f"cd {self.restore_cwd}", recovered.stdout)
+        self.assertNotIn(f"cd {child_cwd}", recovered.stdout)
+        self.assertIn("claude --resume claude-root-project-session", recovered.stdout)
+
     def test_records_and_recovers_codex_with_restore_cwd_and_dash_c(self) -> None:
         recorded = self.run_cli(
             "record",
@@ -201,6 +231,42 @@ class RecoveryCliTests(unittest.TestCase):
         selected = self.run_cli("recover", "1", "--dry-run")
         self.assertEqual(selected.returncode, 0, selected.stderr)
         self.assertIn("claude --resume", selected.stdout)
+
+    def test_title_only_recency_gap_does_not_auto_select(self) -> None:
+        for session_id in ["claude-old-title-only", "claude-new-title-only"]:
+            recorded = self.run_cli(
+                "record",
+                "--tool",
+                "claude",
+                "--event",
+                "UserPromptSubmit",
+                input_json={"session_id": session_id, "cwd": str(self.base / session_id)},
+            )
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_id='old-workspace', workspace_ref='old-workspace-ref',
+                    surface_id='old-surface', surface_ref='old-surface-ref',
+                    workspace_index=NULL, last_seen='2026-05-01T00:00:00Z'
+                WHERE session_id='claude-old-title-only'
+                """
+            )
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_id='old-workspace', workspace_ref='old-workspace-ref',
+                    surface_id='old-surface', surface_ref='old-surface-ref',
+                    workspace_index=NULL, last_seen='2026-05-01T00:10:00Z'
+                WHERE session_id='claude-new-title-only'
+                """
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 3)
+        self.assertIn("multiple possible sessions", recovered.stdout)
+        self.assertIn("claude-new-title-only", recovered.stdout)
 
     def test_missing_match_does_not_start_plain_agent(self) -> None:
         recovered = self.run_cli("recover", "--dry-run")

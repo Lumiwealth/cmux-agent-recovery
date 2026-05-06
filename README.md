@@ -10,6 +10,7 @@ CMUX can restore workspace layout after a relaunch, app update, macOS reboot, or
 - After CMUX restarts, recover one workspace at a time with `cmr`.
 - Never start a fresh `claude` or `codex` session when a resume ID is missing.
 - Never bulk-start every old agent after a crash.
+- Ask before resuming when a restored title points at several title-only matches.
 - Log per-workspace memory and CPU telemetry so runaway sessions are easier to find.
 - Safely stop older/heavy agents while keeping the CMUX tabs ready to recover later.
 
@@ -62,8 +63,8 @@ If multiple sessions match, `cmr` prints choices:
 
 ```text
 cmr: multiple possible sessions found. Pick one with `cmr N`:
-1. codex score=100 last=2026-04-30T01:00:00Z title='Release Notes'
-2. codex score=90 last=2026-04-27T10:00:00Z title='Release Notes'
+1. codex score=100 last=2026-04-30T01:00:00Z title='Release Notes' cwd=/work/repo resume_cwd=/work/repo transcript=12.4MB
+2. codex score=90 last=2026-04-27T10:00:00Z title='Release Notes' cwd=/work/old resume_cwd=/work/old transcript=1.1MB
 ```
 
 Then run:
@@ -79,6 +80,8 @@ cmr --dry-run
 ```
 
 Dry run uses the same match selection as normal recovery. It only prints the command instead of executing it.
+
+For Claude Code, `cmr` prefers the project directory that owns the Claude transcript when it can prove that path. That matters when a session used `cd` during the conversation: Claude may store the resumable session under the original project even if the latest hook saw a child folder.
 
 Audit all current CMUX workspaces:
 
