@@ -73,6 +73,18 @@ Then run:
 cmr 1
 ```
 
+If a tab title was reused or the DB got polluted by a wrong resume, pin the title to the known-good session:
+
+```sh
+cmux-recovery pin --title "Release Notes" --tool codex --session-id <session-id> --cwd "$HOME/Development"
+```
+
+Bad matches can be hidden:
+
+```sh
+cmux-recovery ignore --tool claude --session-id <wrong-session-id> --reason "wrong workspace"
+```
+
 Dry run:
 
 ```sh

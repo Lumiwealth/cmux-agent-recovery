@@ -713,6 +713,69 @@ def cmd_record_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pin(args: argparse.Namespace) -> int:
+    title = clean(args.title)
+    if not title:
+        current = current_workspace()
+        title = clean(current.get("workspace_title"))
+    if not title:
+        print("pin: missing title. Pass --title or run from a CMUX workspace with a title.")
+        return 2
+    session_id = clean(args.session_id)
+    if not session_id:
+        print("pin: missing --session-id")
+        return 2
+    with connect_db() as con:
+        row = con.execute(
+            """
+            SELECT * FROM session_bindings
+            WHERE tool = ? AND session_id = ?
+            """,
+            (args.tool, session_id),
+        ).fetchone()
+        cwd = clean(args.cwd) or (row["cwd"] if row else None) or str(DEFAULT_RESTORE_CWD)
+        now = utc_now()
+        con.execute(
+            """
+            INSERT INTO recovery_pins (
+              normalized_title, workspace_title, tool, session_id, cwd, note, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(normalized_title) DO UPDATE SET
+              workspace_title=excluded.workspace_title,
+              tool=excluded.tool,
+              session_id=excluded.session_id,
+              cwd=excluded.cwd,
+              note=excluded.note,
+              updated_at=excluded.updated_at
+            """,
+            (normalize_title(title), title, args.tool, session_id, cwd, clean(args.note), now, now),
+        )
+        export_latest(con)
+    print(f"pin: {title!r} -> {args.tool} {session_id} cwd={cwd}")
+    return 0
+
+
+def cmd_ignore(args: argparse.Namespace) -> int:
+    session_id = clean(args.session_id)
+    if not session_id:
+        print("ignore: missing --session-id")
+        return 2
+    with connect_db() as con:
+        con.execute(
+            """
+            INSERT INTO ignored_sessions (tool, session_id, reason, ignored_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(tool, session_id) DO UPDATE SET
+              reason=excluded.reason,
+              ignored_at=excluded.ignored_at
+            """,
+            (args.tool, session_id, clean(args.reason), utc_now()),
+        )
+        export_latest(con)
+    print(f"ignore: {args.tool} {session_id}")
+    return 0
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
     with connect_db() as con:
         rows = tree_workspaces()
@@ -1030,10 +1093,22 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
 
 
 def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[dict[str, Any]]:
+    pin = None
+    if current.get("normalized_title"):
+        pin = con.execute(
+            """
+            SELECT * FROM recovery_pins
+            WHERE normalized_title = ?
+            """,
+            (current.get("normalized_title"),),
+        ).fetchone()
     rows = con.execute(
         """
-        SELECT * FROM session_bindings
-        WHERE session_id IS NOT NULL AND session_id != ''
+        SELECT sb.* FROM session_bindings sb
+        LEFT JOIN ignored_sessions ig
+          ON ig.tool = sb.tool AND ig.session_id = sb.session_id
+        WHERE sb.session_id IS NOT NULL AND sb.session_id != ''
+          AND ig.session_id IS NULL
         ORDER BY last_seen DESC
         LIMIT 500
         """
@@ -1041,10 +1116,19 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
     candidates: list[dict[str, Any]] = []
     for row in rows:
         score = score_candidate(current, row)
+        pinned = bool(pin and pin["tool"] == row["tool"] and pin["session_id"] == row["session_id"])
         if score <= 0:
-            continue
+            if not pinned:
+                continue
+            score = 1
         item = dict(row)
+        if pinned:
+            score += 10000
+            item["cwd"] = pin["cwd"] or item.get("cwd")
+            item["workspace_title"] = pin["workspace_title"] or item.get("workspace_title")
+            item["normalized_title"] = pin["normalized_title"] or item.get("normalized_title")
         item["score"] = score
+        item["pinned"] = pinned
         item["title_match"] = bool(current.get("normalized_title") and current.get("normalized_title") == item.get("normalized_title"))
         item["surface_match"] = bool(current.get("surface_id") and current.get("surface_id") == item.get("surface_id"))
         item["workspace_id_match"] = bool(current.get("workspace_id") and current.get("workspace_id") == item.get("workspace_id"))
@@ -1060,6 +1144,44 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             and (not current.get("normalized_title") or item["title_match"])
         )
         item["cwd_match"] = same_path(current.get("current_directory"), item.get("cwd"))
+        item["resume_cwd"] = str(candidate_cwd(item))
+        item["resume_cwd_match"] = same_path(current.get("current_directory"), item.get("resume_cwd"))
+        item.update(transcript_info(item.get("transcript_path")))
+        item["command"] = resume_command(item)
+        candidates.append(item)
+    if pin and not any(item["tool"] == pin["tool"] and item["session_id"] == pin["session_id"] for item in candidates):
+        item = {
+            "tool": pin["tool"],
+            "session_id": pin["session_id"],
+            "first_seen": pin["created_at"],
+            "last_seen": pin["updated_at"],
+            "last_event": "pin",
+            "last_source": "recovery-pin",
+            "cwd": pin["cwd"],
+            "transcript_path": None,
+            "model": None,
+            "permission_mode": None,
+            "workspace_title": pin["workspace_title"],
+            "normalized_title": pin["normalized_title"],
+            "workspace_id": None,
+            "workspace_ref": None,
+            "workspace_index": None,
+            "surface_id": None,
+            "surface_ref": None,
+            "tab_id": None,
+            "pane_id": None,
+            "process_title": None,
+            "tty": None,
+            "payload_json": None,
+            "score": 10000,
+            "pinned": True,
+            "title_match": True,
+            "surface_match": False,
+            "workspace_id_match": False,
+            "workspace_ref_match": False,
+            "index_match": False,
+            "cwd_match": same_path(current.get("current_directory"), pin["cwd"]),
+        }
         item["resume_cwd"] = str(candidate_cwd(item))
         item["resume_cwd_match"] = same_path(current.get("current_directory"), item.get("resume_cwd"))
         item.update(transcript_info(item.get("transcript_path")))
@@ -1128,12 +1250,7 @@ def transcript_info(value: str | None) -> dict[str, Any]:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if obj.get("type") != "user":
-                    continue
-                message = obj.get("message")
-                content = message.get("content") if isinstance(message, dict) else obj.get("content")
-                if isinstance(content, list):
-                    content = " ".join(str(part.get("text") if isinstance(part, dict) else part) for part in content)
+                content = user_text_from_transcript_object(obj)
                 text = re.sub(r"\s+", " ", str(content or "")).strip()
                 if text:
                     info["first_user_prompt"] = text[:220]
@@ -1141,6 +1258,37 @@ def transcript_info(value: str | None) -> dict[str, Any]:
     except OSError:
         pass
     return info
+
+
+def text_from_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        return " ".join(part for part in parts if part)
+    return str(value or "")
+
+
+def user_text_from_transcript_object(obj: dict[str, Any]) -> str:
+    if obj.get("type") == "user":
+        message = obj.get("message")
+        if isinstance(message, dict):
+            return text_from_content(message.get("content"))
+        return text_from_content(obj.get("content"))
+    payload = obj.get("payload")
+    if isinstance(payload, dict):
+        if payload.get("role") == "user":
+            return text_from_content(payload.get("content"))
+        if payload.get("type") == "message" and payload.get("role") == "user":
+            return text_from_content(payload.get("content"))
+        if payload.get("type") == "user_message" or payload.get("prompt"):
+            return text_from_content(payload.get("prompt") or payload.get("message"))
+    return ""
 
 
 def resume_command(candidate: dict[str, Any]) -> str:
@@ -1160,8 +1308,9 @@ def print_candidates(candidates: list[dict[str, Any]], limit: int = 8) -> None:
         if item.get("transcript_bytes") is not None:
             size = f" transcript={int(item['transcript_bytes']) / 1024 / 1024:.1f}MB"
         prompt = item.get("first_user_prompt")
+        pin = " pinned" if item.get("pinned") else ""
         print(
-            f"{idx}. {item['tool']} score={item['score']} last={item.get('last_seen')} "
+            f"{idx}. {item['tool']}{pin} score={item['score']} last={item.get('last_seen')} "
             f"title={title!r} cwd={cwd} resume_cwd={resume_cwd}{size}"
         )
         if prompt:
@@ -1787,6 +1936,20 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--source")
     resume.add_argument("--cwd")
     resume.set_defaults(func=cmd_record_resume)
+
+    pin = sub.add_parser("pin")
+    pin.add_argument("--title")
+    pin.add_argument("--tool", required=True, choices=["claude", "codex"])
+    pin.add_argument("--session-id", required=True)
+    pin.add_argument("--cwd")
+    pin.add_argument("--note")
+    pin.set_defaults(func=cmd_pin)
+
+    ignore = sub.add_parser("ignore")
+    ignore.add_argument("--tool", required=True, choices=["claude", "codex"])
+    ignore.add_argument("--session-id", required=True)
+    ignore.add_argument("--reason")
+    ignore.set_defaults(func=cmd_ignore)
 
     snapshot = sub.add_parser("snapshot")
     snapshot.add_argument("--source", default="manual-snapshot")

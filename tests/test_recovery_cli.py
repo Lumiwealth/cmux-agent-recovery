@@ -268,6 +268,63 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("multiple possible sessions", recovered.stdout)
         self.assertIn("claude-new-title-only", recovered.stdout)
 
+    def test_pin_overrides_poisoned_current_workspace_match(self) -> None:
+        poisoned = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "claude-poisoned-current", "cwd": str(self.base / "MarketingManager")},
+        )
+        self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
+        intended = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "codex-intended", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(intended.returncode, 0, intended.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_id='old-workspace', workspace_ref='old-ref',
+                    surface_id='old-surface', surface_ref='old-surface',
+                    last_seen='2026-05-01T00:00:00Z'
+                WHERE session_id='codex-intended'
+                """
+            )
+
+        pinned = self.run_cli("pin", "--title", "Release Notes", "--tool", "codex", "--session-id", "codex-intended")
+        self.assertEqual(pinned.returncode, 0, pinned.stderr)
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex-intended", recovered.stdout)
+        self.assertNotIn("claude-poisoned-current", recovered.stdout)
+
+    def test_ignore_removes_session_from_candidates(self) -> None:
+        for session_id in ["claude-ignore-me", "claude-keep-me"]:
+            recorded = self.run_cli(
+                "record",
+                "--tool",
+                "claude",
+                "--event",
+                "UserPromptSubmit",
+                input_json={"session_id": session_id, "cwd": str(self.restore_cwd)},
+            )
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        ignored = self.run_cli("ignore", "--tool", "claude", "--session-id", "claude-ignore-me", "--reason", "test")
+        self.assertEqual(ignored.returncode, 0, ignored.stderr)
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("claude-keep-me", recovered.stdout)
+        self.assertNotIn("claude-ignore-me", recovered.stdout)
+
     def test_missing_match_does_not_start_plain_agent(self) -> None:
         recovered = self.run_cli("recover", "--dry-run")
         self.assertEqual(recovered.returncode, 2)

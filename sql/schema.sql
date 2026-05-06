@@ -65,6 +65,28 @@ CREATE INDEX IF NOT EXISTS idx_session_bindings_title
 CREATE INDEX IF NOT EXISTS idx_session_bindings_workspace
   ON session_bindings(workspace_id, surface_id, last_seen DESC);
 
+CREATE TABLE IF NOT EXISTS recovery_pins (
+  normalized_title TEXT PRIMARY KEY,
+  workspace_title TEXT,
+  tool TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  cwd TEXT,
+  note TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_pins_session
+  ON recovery_pins(tool, session_id);
+
+CREATE TABLE IF NOT EXISTS ignored_sessions (
+  tool TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  reason TEXT,
+  ignored_at TEXT NOT NULL,
+  PRIMARY KEY (tool, session_id)
+);
+
 CREATE TABLE IF NOT EXISTS observed_workspaces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   observed_at TEXT NOT NULL,
