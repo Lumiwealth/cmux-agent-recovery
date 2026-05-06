@@ -1016,8 +1016,27 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
     return candidates
 
 
+def usable_cwd(value: str | None) -> Path:
+    candidates: list[Path] = []
+    if value:
+        raw = Path(value).expanduser()
+        candidates.append(raw)
+        try:
+            parts = raw.parts
+            old_root = ("/", "Users", "robertgrzesik", "Documents", "Development")
+            if parts[: len(old_root)] == old_root:
+                candidates.append(Path("/Users/robertgrzesik/Development", *parts[len(old_root) :]))
+        except RuntimeError:
+            pass
+    candidates.append(DEFAULT_RESTORE_CWD)
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return DEFAULT_RESTORE_CWD
+
+
 def resume_command(candidate: dict[str, Any]) -> str:
-    cwd = str(DEFAULT_RESTORE_CWD)
+    cwd = str(usable_cwd(candidate.get("cwd")))
     sid = str(candidate["session_id"])
     if candidate["tool"] == "codex":
         return f"cd {shlex.quote(cwd)} && codex -C {shlex.quote(cwd)} resume {shlex.quote(sid)}"
@@ -1338,7 +1357,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
         print(command)
         return 0
 
-    cwd = str(DEFAULT_RESTORE_CWD)
+    cwd = str(usable_cwd(selected.get("cwd")))
     os.chdir(cwd)
     if selected["tool"] == "codex":
         os.execvp("codex", ["codex", "-C", cwd, "resume", selected["session_id"]])

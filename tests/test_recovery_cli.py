@@ -148,6 +148,24 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn(f"cd {self.restore_cwd}", recovered.stdout)
         self.assertIn("claude --resume claude-session-1", recovered.stdout)
 
+    def test_recovers_claude_from_recorded_project_cwd(self) -> None:
+        project_cwd = self.restore_cwd / "MarketingManager"
+        project_cwd.mkdir()
+        recorded = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "claude-project-session", "cwd": str(project_cwd)},
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn(f"cd {project_cwd}", recovered.stdout)
+        self.assertIn("claude --resume claude-project-session", recovered.stdout)
+
     def test_records_and_recovers_codex_with_restore_cwd_and_dash_c(self) -> None:
         recorded = self.run_cli(
             "record",
