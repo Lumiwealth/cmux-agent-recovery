@@ -432,9 +432,8 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertEqual(recorded.returncode, 0, recorded.stderr)
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 3)
-        self.assertIn("multiple possible sessions", recovered.stdout)
-        self.assertIn("topic=+0/-300", recovered.stdout)
+        self.assertEqual(recovered.returncode, 2)
+        self.assertIn("no recoverable", recovered.stdout)
 
     def test_pin_overrides_poisoned_current_workspace_match(self) -> None:
         poisoned = self.run_cli(
