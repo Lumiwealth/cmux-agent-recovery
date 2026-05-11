@@ -406,6 +406,36 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("codex-trading-agents", recovered.stdout)
         self.assertNotIn("claude-linkedin-poison", recovered.stdout)
 
+    def test_bug_title_does_not_treat_leads_as_generic_outreach(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "CX - Bug: New Leads Missing How Found"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        for session_id, prompt in [
+            (
+                "claude-step-seven-poison",
+                "You are a LinkedIn engagement agent. This is Step 7: TARGETED PROSPECT ENGAGEMENT AND COMMENT MANAGEMENT.",
+            ),
+            (
+                "claude-step-nine-poison",
+                "You are a LinkedIn outreach agent. This is Step 9: ACCEPT INCOMING CONNECTION REQUESTS.",
+            ),
+        ]:
+            recorded = self.run_cli(
+                "record",
+                "--tool",
+                "claude",
+                "--event",
+                "UserPromptSubmit",
+                input_json={"session_id": session_id, "cwd": str(self.restore_cwd / "MarketingManager"), "prompt": prompt},
+            )
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 3)
+        self.assertIn("multiple possible sessions", recovered.stdout)
+        self.assertIn("topic=+0/-300", recovered.stdout)
+
     def test_pin_overrides_poisoned_current_workspace_match(self) -> None:
         poisoned = self.run_cli(
             "record",

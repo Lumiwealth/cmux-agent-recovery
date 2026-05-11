@@ -73,6 +73,15 @@ GENERIC_WORKFLOW_MARKERS = (
     "send connection requests",
     "check profile viewers",
 )
+BUG_OR_INVESTIGATION_TERMS = {
+    "bug",
+    "broken",
+    "debug",
+    "error",
+    "fix",
+    "issue",
+    "missing",
+}
 SESSION_ID_RE = re.compile(
     r"\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,}-[0-9a-f-]{20,})\b",
     re.IGNORECASE,
@@ -1363,7 +1372,13 @@ def topic_match_info(current: dict[str, Any], candidate: dict[str, Any]) -> dict
     relevance = min(72, len(hits) * 18)
     marker_text = text.lower()
     generic_workflow = any(marker in marker_text for marker in GENERIC_WORKFLOW_MARKERS)
-    title_is_generic_outreach = bool(terms) and all(term in GENERIC_OUTREACH_TITLE_TERMS for term in terms)
+    raw_title_terms = set(normalize_title(current.get("workspace_title") or current.get("normalized_title")).split())
+    bug_or_investigation_title = bool(raw_title_terms & BUG_OR_INVESTIGATION_TERMS)
+    title_is_generic_outreach = (
+        bool(terms)
+        and not bug_or_investigation_title
+        and all(term in GENERIC_OUTREACH_TITLE_TERMS for term in terms)
+    )
     penalty = 300 if generic_workflow and not title_is_generic_outreach else 0
     return {
         "topic_relevance": relevance,
