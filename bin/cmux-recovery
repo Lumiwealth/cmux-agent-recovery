@@ -67,11 +67,18 @@ GENERIC_OUTREACH_TITLE_TERMS = {
 GENERIC_WORKFLOW_MARKERS = (
     "linkedin outreach agent",
     "linkedin engagement agent",
+    "linkedin content creation agent",
+    "linkedin content metrics agent",
     "accept incoming connection requests",
     "combined inbox check",
     "reply to active conversations",
     "send connection requests",
     "check profile viewers",
+    "post content to linkedin",
+    "scrape post engagement metrics",
+    "generate daily report",
+    "check messages and new acceptances",
+    "send follow-up messages to non-responders",
 )
 BUG_OR_INVESTIGATION_TERMS = {
     "bug",
@@ -107,7 +114,9 @@ def parse_time(value: str | None) -> float:
 
 
 def normalize_title(value: str | None) -> str:
-    text = (value or "").strip().lower()
+    text = (value or "").strip()
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    text = text.lower()
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"[^0-9a-z]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -123,6 +132,54 @@ def title_terms(value: str | None) -> list[str]:
             seen.add(term)
             terms.append(term)
     return terms
+
+
+def title_topic_signals(value: str | None) -> list[str]:
+    normalized = normalize_title(value)
+    tokens = normalized.split()
+    signals: list[str] = []
+    seen: set[str] = set()
+
+    def add(signal: str) -> None:
+        key = normalize_title(signal)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        signals.append(key)
+
+    for term in title_terms(value):
+        add(term)
+
+    token_set = set(tokens)
+    if {"how", "found"} <= token_set:
+        add("how found")
+        add("how found us")
+        add("howfoundus")
+    if "new" in token_set and ({"lead"} & token_set or {"leads"} & token_set):
+        add("new lead")
+        add("new leads")
+        add("lead created")
+        add("leadcreated")
+
+    return signals
+
+
+def topic_hits_for_title(title: str | None, text: str | None) -> list[str]:
+    normalized_text = normalize_title(text)
+    if not normalized_text:
+        return []
+    hits: list[str] = []
+    for signal in title_topic_signals(title):
+        words = signal.split()
+        if not words:
+            continue
+        if len(words) > 1:
+            pattern = r"\b" + r"\s+".join(re.escape(word) for word in words) + r"\b"
+        else:
+            pattern = rf"\b{re.escape(words[0])}[a-z0-9]*\b"
+        if re.search(pattern, normalized_text):
+            hits.append(signal)
+    return hits
 
 
 def clean(value: Any) -> str | None:
@@ -282,6 +339,8 @@ def saved_session_path() -> Path:
 
 
 def saved_session_workspaces() -> list[dict[str, Any]]:
+    if os.environ.get("CMUX_RECOVERY_DISABLE_SAVED_SESSION", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return []
     path = saved_session_path()
     if not path.exists():
         return []
@@ -1141,10 +1200,22 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
     cwd_match = same_path(current.get("current_directory"), candidate["cwd"])
     resume_cwd = candidate_cwd(dict(candidate))
     resume_cwd_match = same_path(current.get("current_directory"), str(resume_cwd))
+    process_title_hits = topic_hits_for_title(
+        current.get("normalized_title") or current.get("workspace_title"),
+        candidate["process_title"],
+    )
+    process_title_topic_match = bool((cwd_match or resume_cwd_match) and process_title_hits)
 
     # Title text is matched literally. User-defined title markers may make a
     # title more unique, but they are not interpreted as tool metadata.
-    if not (title_match or surface_match or workspace_id_match or workspace_ref_match or index_match):
+    if not (
+        title_match
+        or surface_match
+        or workspace_id_match
+        or workspace_ref_match
+        or index_match
+        or process_title_topic_match
+    ):
         return 0
 
     if surface_match:
@@ -1161,6 +1232,8 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
         score += 35
     if index_match:
         score += 8
+    if process_title_topic_match:
+        score += 55 + min(45, len(process_title_hits) * 15)
     age = max(0.0, time.time() - parse_time(candidate["last_seen"]))
     if age < 6 * 60 * 60:
         score += 25
@@ -1188,17 +1261,11 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
     for row in rows:
         score = score_candidate(current, row)
         pinned = bool(pin and pin["tool"] == row["tool"] and pin["session_id"] == row["session_id"])
-        if score <= 0:
-            if not pinned:
-                continue
-            score = 1
         item = dict(row)
         if pinned:
-            score += 10000
             item["cwd"] = pin["cwd"] or item.get("cwd")
             item["workspace_title"] = pin["workspace_title"] or item.get("workspace_title")
             item["normalized_title"] = pin["normalized_title"] or item.get("normalized_title")
-        item["score"] = score
         item["pinned"] = pinned
         item["title_match"] = bool(current.get("normalized_title") and current.get("normalized_title") == item.get("normalized_title"))
         item["surface_match"] = bool(current.get("surface_id") and current.get("surface_id") == item.get("surface_id"))
@@ -1217,11 +1284,35 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
         item["cwd_match"] = same_path(current.get("current_directory"), item.get("cwd"))
         item["resume_cwd"] = str(candidate_cwd(item))
         item["resume_cwd_match"] = same_path(current.get("current_directory"), item.get("resume_cwd"))
+        item["process_title_topic_match"] = bool(
+            (item["cwd_match"] or item["resume_cwd_match"])
+            and topic_hits_for_title(
+                current.get("normalized_title") or current.get("workspace_title"),
+                item.get("process_title"),
+            )
+        )
         item.update(transcript_info(item.get("transcript_path")))
         topic = topic_match_info(current, item)
         item.update(topic)
+        if score <= 0:
+            if pinned:
+                score = 1
+            elif (item["cwd_match"] or item["resume_cwd_match"]) and topic.get("topic_hits"):
+                score = 50
+                if item["cwd_match"]:
+                    score += 25
+                elif item["resume_cwd_match"]:
+                    score += 35
+            else:
+                continue
+        if pinned:
+            score += 10000
         score += int(topic.get("topic_relevance") or 0)
         score -= int(topic.get("topic_penalty") or 0)
+        if int(topic.get("topic_relevance") or 0) >= 36:
+            age = max(0.0, time.time() - parse_time(item.get("last_seen")))
+            if age < 24 * 60 * 60:
+                score += 15
         item["score"] = score
         item["command"] = resume_command(item)
         candidates.append(item)
@@ -1361,14 +1452,12 @@ def candidate_topic_text(candidate: dict[str, Any]) -> str:
 
 
 def topic_match_info(current: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
-    if not candidate.get("title_match"):
-        return {"topic_relevance": 0, "topic_penalty": 0, "topic_terms": [], "topic_hits": []}
-    terms = title_terms(current.get("normalized_title") or current.get("workspace_title"))
+    title = current.get("normalized_title") or current.get("workspace_title")
+    terms = title_topic_signals(title)
     if not terms:
         return {"topic_relevance": 0, "topic_penalty": 0, "topic_terms": [], "topic_hits": []}
     text = candidate_topic_text(candidate)
-    normalized_text = normalize_title(text)
-    hits = [term for term in terms if re.search(rf"\b{re.escape(term)}\b", normalized_text)]
+    hits = topic_hits_for_title(title, text)
     relevance = min(72, len(hits) * 18)
     marker_text = text.lower()
     generic_workflow = any(marker in marker_text for marker in GENERIC_WORKFLOW_MARKERS)
@@ -1379,7 +1468,7 @@ def topic_match_info(current: dict[str, Any], candidate: dict[str, Any]) -> dict
         and not bug_or_investigation_title
         and all(term in GENERIC_OUTREACH_TITLE_TERMS for term in terms)
     )
-    penalty = 300 if generic_workflow and not title_is_generic_outreach else 0
+    penalty = 450 if generic_workflow and not title_is_generic_outreach else 0
     return {
         "topic_relevance": relevance,
         "topic_penalty": penalty,
@@ -1525,6 +1614,7 @@ def public_current_summary(current: dict[str, Any]) -> dict[str, Any]:
     keys = [
         "workspace_title",
         "normalized_title",
+        "codex_state_imported",
         "workspace_id",
         "workspace_ref",
         "workspace_index",
@@ -1560,6 +1650,7 @@ def public_candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
         "index_match",
         "cwd_match",
         "resume_cwd_match",
+        "process_title_topic_match",
         "pinned",
         "transcript_path",
         "transcript_exists",
@@ -1906,13 +1997,25 @@ def cmd_trim(args: argparse.Namespace) -> int:
     return 0
 
 
+def default_codex_state_path() -> Path:
+    return Path(os.environ.get("CMUX_CODEX_STATE", "~/.codex/state_5.sqlite")).expanduser()
+
+
+def refresh_codex_state(con: sqlite3.Connection) -> int:
+    return import_codex_state(con, default_codex_state_path())
+
+
 def cmd_recover(args: argparse.Namespace) -> int:
     action = "recover-dry-run" if args.dry_run else "recover"
     with connect_db() as con:
+        codex_imported = refresh_codex_state(con)
         rows = tree_workspaces()
         insert_workspace_observations(con, "recover", rows)
         record_memory_snapshot(con, "recover", rows)
         current = current_workspace()
+        current["codex_state_imported"] = codex_imported
+        if not current.get("current_directory"):
+            current["current_directory"] = str(DEFAULT_RESTORE_CWD)
         if not current.get("normalized_title"):
             current["normalized_title"] = normalize_title(current.get("workspace_title"))
         candidates = load_candidates(con, current)
@@ -1970,11 +2073,14 @@ def cmd_recover(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     with connect_db() as con:
+        refresh_codex_state(con)
         rows = tree_workspaces()
         insert_workspace_observations(con, "verify", rows)
         record_memory_snapshot(con, "verify", rows)
         chooser_args = argparse.Namespace(choice=None)
         for ws in rows:
+            if not ws.get("current_directory"):
+                ws["current_directory"] = str(DEFAULT_RESTORE_CWD)
             candidates = load_candidates(con, ws)
             status, selected = choose_candidate(chooser_args, candidates)
             status = "exact" if status == "selected" else status

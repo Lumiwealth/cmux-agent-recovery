@@ -118,6 +118,8 @@ class RecoveryCliTests(unittest.TestCase):
             "CMUX_RESTORE_CWD": str(self.restore_cwd),
             "CMUX_RECOVERY_DEBUG_DIR": str(self.base / "logs"),
             "CMUX_RECOVERY_DISABLE_MEMORY": "1",
+            "CMUX_RECOVERY_DISABLE_SAVED_SESSION": "1",
+            "CMUX_CODEX_STATE": str(self.base / "missing-codex-state.sqlite"),
         }
 
     def tearDown(self) -> None:
@@ -434,6 +436,57 @@ class RecoveryCliTests(unittest.TestCase):
         recovered = self.run_cli("recover", "--dry-run")
         self.assertEqual(recovered.returncode, 2)
         self.assertIn("no recoverable", recovered.stdout)
+
+    def test_codex_state_topic_match_beats_linkedin_content_poison(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "CX - Fargate Deploy Test"
+        tree["windows"][0]["workspaces"][0]["index"] = 99
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        state = self.base / "codex-state.sqlite"
+        self.env["CMUX_CODEX_STATE"] = str(state)
+        rollout = self.base / "rollout-fargate.jsonl"
+        rollout.write_text(
+            json.dumps({"type": "user", "message": {"content": "Research Fargate deployment runners."}}) + "\n",
+            encoding="utf-8",
+        )
+        with sqlite3.connect(state) as con:
+            con.execute(
+                "CREATE TABLE threads (id TEXT, updated_at INTEGER, cwd TEXT, rollout_path TEXT, title TEXT, model TEXT, approval_mode TEXT, sandbox_policy TEXT, archived INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-fargate-deploy",
+                    2000000000,
+                    str(self.restore_cwd),
+                    str(rollout),
+                    "Plan the Fargate deployment runner",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+
+        poisoned = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={
+                "session_id": "claude-linkedin-content-poison",
+                "cwd": str(self.restore_cwd / "MarketingManager"),
+                "prompt": "You are a LinkedIn content creation agent. This is Step 6: POST CONTENT TO LINKEDIN.",
+            },
+        )
+        self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex-fargate-deploy", recovered.stdout)
+        self.assertNotIn("claude-linkedin-content-poison", recovered.stdout)
 
     def test_pin_overrides_poisoned_current_workspace_match(self) -> None:
         poisoned = self.run_cli(
