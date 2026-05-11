@@ -22,6 +22,8 @@ DEFAULT_DB = ROOT / "state" / "cmux-recovery.sqlite"
 DEFAULT_LATEST_JSON = ROOT / "state" / "latest.json"
 DEFAULT_RESTORE_CWD = Path(os.environ.get("CMUX_RESTORE_CWD", "~/Development")).expanduser()
 DEFAULT_CMUX_BIN = Path("/Applications/cmux.app/Contents/Resources/bin/cmux")
+DEFAULT_DEBUG_DIR = ROOT / "logs"
+TITLE_ONLY_AUTO_SELECT_GAP_SECONDS = 15 * 60
 SESSION_ID_RE = re.compile(
     r"\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,}-[0-9a-f-]{20,})\b",
     re.IGNORECASE,
@@ -1102,17 +1104,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             """,
             (current.get("normalized_title"),),
         ).fetchone()
-    rows = con.execute(
-        """
-        SELECT sb.* FROM session_bindings sb
-        LEFT JOIN ignored_sessions ig
-          ON ig.tool = sb.tool AND ig.session_id = sb.session_id
-        WHERE sb.session_id IS NOT NULL AND sb.session_id != ''
-          AND ig.session_id IS NULL
-        ORDER BY last_seen DESC
-        LIMIT 500
-        """
-    ).fetchall()
+    rows = candidate_rows(con, current)
     candidates: list[dict[str, Any]] = []
     for row in rows:
         score = score_candidate(current, row)
@@ -1189,6 +1181,70 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
         candidates.append(item)
     candidates.sort(key=lambda item: (item["score"], parse_time(item.get("last_seen"))), reverse=True)
     return candidates
+
+
+def session_binding_rows(
+    con: sqlite3.Connection,
+    where_sql: str = "",
+    params: tuple[Any, ...] = (),
+    *,
+    limit: int = 500,
+) -> list[sqlite3.Row]:
+    where = f" AND ({where_sql})" if where_sql else ""
+    return con.execute(
+        """
+        SELECT sb.* FROM session_bindings sb
+        LEFT JOIN ignored_sessions ig
+          ON ig.tool = sb.tool AND ig.session_id = sb.session_id
+        WHERE sb.session_id IS NOT NULL AND sb.session_id != ''
+          AND ig.session_id IS NULL
+        """ + where + """
+        ORDER BY last_seen DESC
+        LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+
+
+def candidate_rows(con: sqlite3.Connection, current: dict[str, Any]) -> list[sqlite3.Row]:
+    rows: list[sqlite3.Row] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(batch: list[sqlite3.Row]) -> None:
+        for row in batch:
+            key = (row["tool"], row["session_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+
+    add(session_binding_rows(con, limit=500))
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    if current.get("normalized_title"):
+        clauses.append("sb.normalized_title = ?")
+        params.append(current.get("normalized_title"))
+    for column, key in [
+        ("workspace_id", "workspace_id"),
+        ("workspace_ref", "workspace_ref"),
+        ("surface_id", "surface_id"),
+        ("surface_ref", "surface_ref"),
+    ]:
+        if current.get(key):
+            clauses.append(f"sb.{column} = ?")
+            params.append(current.get(key))
+    if current.get("workspace_index") is not None and current.get("normalized_title"):
+        clauses.append("(sb.workspace_index = ? AND sb.normalized_title = ?)")
+        params.extend([current.get("workspace_index"), current.get("normalized_title")])
+    cwd_values = [str(path) for path in path_variants(current.get("current_directory"))]
+    if cwd_values:
+        placeholders = ",".join("?" for _ in cwd_values)
+        clauses.append(f"sb.cwd IN ({placeholders})")
+        params.extend(cwd_values)
+    if clauses:
+        add(session_binding_rows(con, " OR ".join(clauses), tuple(params), limit=1000))
+    return rows
 
 
 def usable_cwd(value: str | None) -> Path:
@@ -1317,7 +1373,100 @@ def print_candidates(candidates: list[dict[str, Any]], limit: int = 8) -> None:
             print(f"   first_user={prompt!r}")
 
 
-def log_restore(con: sqlite3.Connection, action: str, status: str, current: dict[str, Any], selected: dict[str, Any] | None, candidates: list[dict[str, Any]]) -> None:
+def debug_dir() -> Path:
+    return Path(os.environ.get("CMUX_RECOVERY_DEBUG_DIR", str(DEFAULT_DEBUG_DIR))).expanduser()
+
+
+def public_current_summary(current: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "workspace_title",
+        "normalized_title",
+        "workspace_id",
+        "workspace_ref",
+        "workspace_index",
+        "surface_id",
+        "surface_ref",
+        "tty",
+        "current_directory",
+    ]
+    return {key: current.get(key) for key in keys}
+
+
+def public_candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "tool",
+        "session_id",
+        "score",
+        "last_seen",
+        "last_event",
+        "last_source",
+        "workspace_title",
+        "normalized_title",
+        "workspace_id",
+        "workspace_ref",
+        "workspace_index",
+        "surface_id",
+        "surface_ref",
+        "cwd",
+        "resume_cwd",
+        "title_match",
+        "surface_match",
+        "workspace_id_match",
+        "workspace_ref_match",
+        "index_match",
+        "cwd_match",
+        "resume_cwd_match",
+        "pinned",
+        "transcript_path",
+        "transcript_exists",
+        "transcript_bytes",
+        "first_user_prompt",
+        "command",
+    ]
+    return {key: item.get(key) for key in keys}
+
+
+def write_recover_debug_log(
+    *,
+    action: str,
+    status: str,
+    current: dict[str, Any],
+    selected: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+    choice: int | None,
+    dry_run: bool,
+) -> Path:
+    directory = debug_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = utc_now().replace(":", "").replace("-", "")
+    title = normalize_title(current.get("workspace_title")) or "untitled"
+    safe_title = re.sub(r"[^0-9a-z]+", "-", title).strip("-")[:48] or "untitled"
+    path = directory / f"cmr-{stamp}-{safe_title}.json"
+    payload = {
+        "observed_at": utc_now(),
+        "action": action,
+        "status": status,
+        "dry_run": dry_run,
+        "choice": choice,
+        "database": str(db_path()),
+        "current": public_current_summary(current),
+        "selected": public_candidate_summary(selected) if selected else None,
+        "candidate_count": len(candidates),
+        "candidates": [public_candidate_summary(item) for item in candidates[:25]],
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def log_restore(
+    con: sqlite3.Connection,
+    action: str,
+    status: str,
+    current: dict[str, Any],
+    selected: dict[str, Any] | None,
+    candidates: list[dict[str, Any]],
+    debug_path: Path | None = None,
+) -> None:
     con.execute(
         """
         INSERT INTO restore_events (
@@ -1337,9 +1486,39 @@ def log_restore(con: sqlite3.Connection, action: str, status: str, current: dict
             selected.get("session_id") if selected else None,
             selected.get("score") if selected else None,
             selected.get("command") if selected else None,
-            json.dumps({"candidates": candidates[:10]}, default=str, ensure_ascii=False),
+            json.dumps(
+                {
+                    "debug_log": str(debug_path) if debug_path else None,
+                    "current": public_current_summary(current),
+                    "candidates": [public_candidate_summary(item) for item in candidates[:10]],
+                },
+                default=str,
+                ensure_ascii=False,
+            ),
         ),
     )
+
+
+def strong_candidate_match(item: dict[str, Any]) -> bool:
+    strong_keys = ("surface_match", "workspace_id_match", "workspace_ref_match", "cwd_match", "resume_cwd_match", "index_match")
+    return any(item.get(key) for key in strong_keys)
+
+
+def can_auto_select_title_only(top: dict[str, Any], second: dict[str, Any] | None) -> bool:
+    if not second:
+        return False
+    if not top.get("title_match") or not second.get("title_match"):
+        return False
+    if strong_candidate_match(top) or strong_candidate_match(second):
+        return False
+    if top.get("tool") != second.get("tool"):
+        return False
+    if not same_path(top.get("resume_cwd"), second.get("resume_cwd")):
+        return False
+    if normalize_title(top.get("workspace_title")) != normalize_title(second.get("workspace_title")):
+        return False
+    gap = parse_time(top.get("last_seen")) - parse_time(second.get("last_seen"))
+    return gap >= TITLE_ONLY_AUTO_SELECT_GAP_SECONDS
 
 
 def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
@@ -1352,10 +1531,11 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
         return "missing", None
     top = candidates[0]
     second = candidates[1] if len(candidates) > 1 else None
-    strong_keys = ("surface_match", "workspace_id_match", "workspace_ref_match", "cwd_match", "resume_cwd_match", "index_match")
-    top_strong = any(top.get(key) for key in strong_keys)
+    top_strong = strong_candidate_match(top)
     second_title_match = bool(second and second.get("title_match"))
     if top.get("title_match") and not top_strong and second_title_match:
+        if can_auto_select_title_only(top, second):
+            return "selected", top
         return "ambiguous", None
     if top["score"] >= 75 and (second is None or top["score"] - second["score"] >= 20):
         return "selected", top
@@ -1592,6 +1772,7 @@ def cmd_trim(args: argparse.Namespace) -> int:
 
 
 def cmd_recover(args: argparse.Namespace) -> int:
+    action = "recover-dry-run" if args.dry_run else "recover"
     with connect_db() as con:
         rows = tree_workspaces()
         insert_workspace_observations(con, "recover", rows)
@@ -1601,23 +1782,37 @@ def cmd_recover(args: argparse.Namespace) -> int:
             current["normalized_title"] = normalize_title(current.get("workspace_title"))
         candidates = load_candidates(con, current)
         status, selected = choose_candidate(args, candidates)
-        log_restore(con, "recover-dry-run" if args.dry_run else "recover", status, current, selected, candidates)
+        debug_path = write_recover_debug_log(
+            action=action,
+            status=status,
+            current=current,
+            selected=selected,
+            candidates=candidates,
+            choice=args.choice,
+            dry_run=args.dry_run,
+        )
+        log_restore(con, action, status, current, selected, candidates, debug_path)
         con.commit()
 
     if status == "missing":
         print("cmr: no recoverable Claude/Codex session found for this workspace.")
+        print(f"cmr: debug log {debug_path}")
         return 2
     if status == "ambiguous":
         print("cmr: multiple possible sessions found. Pick one with `cmr N`:")
         print_candidates(candidates)
+        print(f"cmr: debug log {debug_path}")
         return 3
     if status == "invalid-choice":
         print("cmr: invalid choice. Current candidates:")
         print_candidates(candidates)
+        print(f"cmr: debug log {debug_path}")
         return 4
 
     assert selected is not None
     command = selected["command"]
+    if args.debug:
+        print(f"cmr: debug log {debug_path}")
     if args.dry_run:
         print(command)
         return 0
@@ -1995,6 +2190,7 @@ def build_parser() -> argparse.ArgumentParser:
     recover = sub.add_parser("recover")
     recover.add_argument("choice", nargs="?", type=int)
     recover.add_argument("--dry-run", action="store_true")
+    recover.add_argument("--debug", action="store_true")
     recover.set_defaults(func=cmd_recover)
 
     verify = sub.add_parser("verify")

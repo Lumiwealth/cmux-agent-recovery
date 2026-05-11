@@ -116,6 +116,7 @@ class RecoveryCliTests(unittest.TestCase):
             "CMUX_BIN": str(self.fake_cmux),
             "CMUX_RECOVERY_DB": str(self.db),
             "CMUX_RESTORE_CWD": str(self.restore_cwd),
+            "CMUX_RECOVERY_DEBUG_DIR": str(self.base / "logs"),
             "CMUX_RECOVERY_DISABLE_MEMORY": "1",
         }
 
@@ -267,6 +268,89 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 3)
         self.assertIn("multiple possible sessions", recovered.stdout)
         self.assertIn("claude-new-title-only", recovered.stdout)
+
+    def test_title_only_recency_gap_can_auto_select_newest_same_cwd(self) -> None:
+        shared_cwd = self.base / "shared-title-work"
+        shared_cwd.mkdir()
+        for session_id in ["claude-old-title-gap", "claude-new-title-gap"]:
+            recorded = self.run_cli(
+                "record",
+                "--tool",
+                "claude",
+                "--event",
+                "UserPromptSubmit",
+                input_json={"session_id": session_id, "cwd": str(shared_cwd)},
+            )
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_id='old-workspace', workspace_ref='old-workspace-ref',
+                    surface_id='old-surface', surface_ref='old-surface-ref',
+                    workspace_index=NULL, last_seen='2026-05-01T00:00:00Z'
+                WHERE session_id='claude-old-title-gap'
+                """
+            )
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_id='old-workspace', workspace_ref='old-workspace-ref',
+                    surface_id='old-surface', surface_ref='old-surface-ref',
+                    workspace_index=NULL, last_seen='2026-05-01T00:20:00Z'
+                WHERE session_id='claude-new-title-gap'
+                """
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("claude-new-title-gap", recovered.stdout)
+        self.assertNotIn("claude-old-title-gap", recovered.stdout)
+
+    def test_old_matching_title_is_not_lost_behind_recent_global_limit(self) -> None:
+        old = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "codex-old-release-notes", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(old.returncode, 0, old.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_id='old-workspace', workspace_ref='old-workspace-ref',
+                    surface_id='old-surface', surface_ref='old-surface-ref',
+                    workspace_index=NULL, last_seen='2026-04-01T00:00:00Z'
+                WHERE session_id='codex-old-release-notes'
+                """
+            )
+            for index in range(600):
+                con.execute(
+                    """
+                    INSERT INTO session_bindings (
+                      tool, session_id, first_seen, last_seen, last_event, last_source,
+                      cwd, workspace_title, normalized_title
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "claude",
+                        f"unrelated-{index}",
+                        "2026-05-01T00:00:00Z",
+                        f"2026-05-01T00:{index % 60:02d}:00Z",
+                        "UserPromptSubmit",
+                        "test",
+                        str(self.base / "unrelated"),
+                        f"Unrelated {index}",
+                        f"unrelated {index}",
+                    ),
+                )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex-old-release-notes", recovered.stdout)
 
     def test_pin_overrides_poisoned_current_workspace_match(self) -> None:
         poisoned = self.run_cli(
