@@ -130,20 +130,11 @@ def normalize_title(value: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-TITLE_PREFIX_TOKENS = {"cx"}
-
-
 def title_match_keys(value: str | None) -> set[str]:
     normalized = normalize_title(value)
     if not normalized:
         return set()
-    keys = {normalized}
-    tokens = normalized.split()
-    while tokens and tokens[0] in TITLE_PREFIX_TOKENS:
-        tokens = tokens[1:]
-        if tokens:
-            keys.add(" ".join(tokens))
-    return keys
+    return {normalized}
 
 
 def title_matches(current_title: str | None, candidate_title: str | None, candidate_workspace_title: str | None = None) -> bool:
@@ -1384,7 +1375,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             else:
                 continue
         if pinned:
-            score += 10000
+            score += 50000
         score += int(topic.get("topic_relevance") or 0)
         score -= int(topic.get("topic_penalty") or 0)
         if int(topic.get("topic_relevance") or 0) >= 36:
@@ -1516,7 +1507,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             "process_title": None,
             "tty": None,
             "payload_json": None,
-            "score": 10000,
+            "score": 50000,
             "pinned": True,
             "title_match": True,
             "surface_match": False,

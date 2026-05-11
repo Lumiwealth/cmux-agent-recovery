@@ -609,7 +609,7 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("codex-taxes-session", recovered.stdout)
         self.assertNotIn("claude-client-christy", recovered.stdout)
 
-    def test_cosmetic_cx_prefix_still_matches_exact_title(self) -> None:
+    def test_cx_prefix_is_part_of_exact_title(self) -> None:
         tree = json.loads(json.dumps(TREE))
         tree["windows"][0]["workspaces"][0]["title"] = "🚀 CX - Paraxanthine"
         self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
@@ -638,8 +638,9 @@ class RecoveryCliTests(unittest.TestCase):
             )
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 0, recovered.stderr)
-        self.assertIn("claude --resume claude-paraxanthine-session", recovered.stdout)
+        self.assertEqual(recovered.returncode, 2, recovered.stderr)
+        self.assertIn("cmr: no recoverable Claude/Codex session found", recovered.stdout)
+        self.assertNotIn("claude --resume claude-paraxanthine-session", recovered.stdout)
 
     def test_sales_and_marketing_prefixes_are_not_interchangeable(self) -> None:
         tree = json.loads(json.dumps(TREE))
@@ -968,6 +969,62 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertIn("codex-intended", recovered.stdout)
         self.assertNotIn("claude-poisoned-current", recovered.stdout)
+
+    def test_pin_beats_current_screen_resume(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "CX - Paraxanthine"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+        self.env["CMUX_FAKE_SCREEN_TEXT"] = "Resume this session with:\nclaude --resume claude-wrong-paraxanthine\n"
+
+        wrong = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "Stop",
+            input_json={"session_id": "claude-wrong-paraxanthine", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(wrong.returncode, 0, wrong.stderr)
+        intended = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "Stop",
+            input_json={"session_id": "codex-right-paraxanthine", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(intended.returncode, 0, intended.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_title='Paraxanthine', normalized_title='paraxanthine'
+                WHERE session_id='claude-wrong-paraxanthine'
+                """
+            )
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_title='CX - Paraxanthine', normalized_title='cx paraxanthine'
+                WHERE session_id='codex-right-paraxanthine'
+                """
+            )
+
+        pinned = self.run_cli(
+            "pin",
+            "--title",
+            "CX - Paraxanthine",
+            "--tool",
+            "codex",
+            "--session-id",
+            "codex-right-paraxanthine",
+        )
+        self.assertEqual(pinned.returncode, 0, pinned.stderr)
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex-right-paraxanthine", recovered.stdout)
+        self.assertNotIn("claude-wrong-paraxanthine", recovered.stdout)
 
     def test_ignore_removes_session_from_candidates(self) -> None:
         for session_id in ["claude-ignore-me", "claude-keep-me"]:
