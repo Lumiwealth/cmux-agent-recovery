@@ -95,6 +95,12 @@ SESSION_ID_RE = re.compile(
     r"\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,}-[0-9a-f-]{20,})\b",
     re.IGNORECASE,
 )
+SCREEN_RESUME_RE = re.compile(
+    r"\b(?P<tool>codex|claude)\b(?:\s+-C\s+\S+)?\s+(?:resume|--resume)\s+(?P<session_id>[0-9a-f][0-9a-f-]{20,})\b",
+    re.IGNORECASE,
+)
+SCREEN_SCROLLBACK_LINES = 2400
+SCREEN_TRANSCRIPT_SCAN_LIMIT = 300
 
 
 def utc_now() -> str:
@@ -122,6 +128,28 @@ def normalize_title(value: str | None) -> str:
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"[^0-9a-z]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+TITLE_PREFIX_TOKENS = {"cx", "sales", "marketing"}
+
+
+def title_match_keys(value: str | None) -> set[str]:
+    normalized = normalize_title(value)
+    if not normalized:
+        return set()
+    keys = {normalized}
+    tokens = normalized.split()
+    while tokens and tokens[0] in TITLE_PREFIX_TOKENS:
+        tokens = tokens[1:]
+        if tokens:
+            keys.add(" ".join(tokens))
+    return keys
+
+
+def title_matches(current_title: str | None, candidate_title: str | None, candidate_workspace_title: str | None = None) -> bool:
+    current_keys = title_match_keys(current_title)
+    candidate_keys = title_match_keys(candidate_title) | title_match_keys(candidate_workspace_title)
+    return bool(current_keys and candidate_keys and current_keys & candidate_keys)
 
 
 def title_terms(value: str | None) -> list[str]:
@@ -492,6 +520,48 @@ def current_workspace() -> dict[str, Any]:
     if selected:
         return {**selected, **{k: v for k, v in ident.items() if v}}
     return {k: v for k, v in ident.items() if v}
+
+
+def read_screen_text(current: dict[str, Any], *, lines: int = SCREEN_SCROLLBACK_LINES) -> str:
+    workspace = current.get("workspace_id") or current.get("workspace_ref")
+    surface = current.get("surface_id") or current.get("surface_ref")
+    if not workspace or not surface:
+        return ""
+    out = run_cmux(
+        [
+            "read-screen",
+            "--workspace",
+            str(workspace),
+            "--surface",
+            str(surface),
+            "--scrollback",
+            "--lines",
+            str(lines),
+        ],
+        timeout=3.0,
+    )
+    return out or ""
+
+
+def screen_resume_refs_from_text(out: str) -> list[dict[str, str]]:
+    if not out:
+        return []
+    refs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for match in SCREEN_RESUME_RE.finditer(out):
+        tool = match.group("tool").lower()
+        session_id = match.group("session_id")
+        key = (tool, session_id)
+        if key in seen:
+            refs = [item for item in refs if (item["tool"], item["session_id"]) != key]
+        seen.add(key)
+        refs.append({"tool": tool, "session_id": session_id})
+    refs.reverse()
+    return refs[:1]
+
+
+def screen_resume_refs(current: dict[str, Any]) -> list[dict[str, str]]:
+    return screen_resume_refs_from_text(read_screen_text(current))
 
 
 def insert_workspace_observations(con: sqlite3.Connection, source: str, rows: list[dict[str, Any]] | None = None) -> None:
@@ -1202,13 +1272,7 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
     current_title = current.get("normalized_title")
     candidate_title = candidate["normalized_title"]
     candidate_workspace_title = normalize_title(candidate["workspace_title"])
-    title_match = bool(
-        current_title
-        and (
-            (candidate_title and current_title == candidate_title)
-            or (candidate_workspace_title and current_title == candidate_workspace_title)
-        )
-    )
+    title_match = title_matches(current_title, candidate_title, candidate_workspace_title)
     surface_match = bool(current.get("surface_id") and current.get("surface_id") == candidate["surface_id"])
     workspace_id_match = bool(current.get("workspace_id") and current.get("workspace_id") == candidate["workspace_id"])
     raw_workspace_ref_match = bool(current.get("workspace_ref") and current.get("workspace_ref") == candidate["workspace_ref"])
@@ -1268,6 +1332,13 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
         ).fetchone()
     rows = candidate_rows(con, current)
     candidates: list[dict[str, Any]] = []
+    screen_refs = [
+        item
+        for item in current.get("screen_resume_refs") or []
+        if isinstance(item, dict) and item.get("tool") in {"claude", "codex"} and item.get("session_id")
+    ]
+    screen_ref_keys = {(item["tool"], item["session_id"]) for item in screen_refs}
+    screen_snippets = screen_match_snippets(str(current.get("screen_text") or ""))
     for row in rows:
         score = score_candidate(current, row)
         pinned = bool(pin and pin["tool"] == row["tool"] and pin["session_id"] == row["session_id"])
@@ -1277,13 +1348,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             item["workspace_title"] = pin["workspace_title"] or item.get("workspace_title")
             item["normalized_title"] = pin["normalized_title"] or item.get("normalized_title")
         item["pinned"] = pinned
-        item["title_match"] = bool(
-            current.get("normalized_title")
-            and (
-                current.get("normalized_title") == item.get("normalized_title")
-                or current.get("normalized_title") == normalize_title(item.get("workspace_title"))
-            )
-        )
+        item["title_match"] = title_matches(current.get("normalized_title"), item.get("normalized_title"), item.get("workspace_title"))
         item["surface_match"] = bool(current.get("surface_id") and current.get("surface_id") == item.get("surface_id"))
         item["workspace_id_match"] = bool(current.get("workspace_id") and current.get("workspace_id") == item.get("workspace_id"))
         item["workspace_ref_match"] = bool(
@@ -1320,6 +1385,99 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
         item["score"] = score
         item["command"] = resume_command(item)
         candidates.append(item)
+    for idx, ref in enumerate(screen_refs):
+        if any(item["tool"] == ref["tool"] and item["session_id"] == ref["session_id"] for item in candidates):
+            for item in candidates:
+                if item["tool"] == ref["tool"] and item["session_id"] == ref["session_id"]:
+                    item["current_screen_resume"] = True
+                    item["score"] = max(int(item.get("score") or 0), 20000 - idx)
+            continue
+        row = session_binding_row(con, ref["tool"], ref["session_id"])
+        base = dict(row) if row else {}
+        item = {
+            "tool": ref["tool"],
+            "session_id": ref["session_id"],
+            "first_seen": base.get("first_seen") or utc_now(),
+            "last_seen": base.get("last_seen") or utc_now(),
+            "last_event": base.get("last_event") or "screen-resume",
+            "last_source": base.get("last_source") or "current-screen",
+            "cwd": base.get("cwd") or current.get("current_directory") or str(DEFAULT_RESTORE_CWD),
+            "transcript_path": base.get("transcript_path"),
+            "model": base.get("model"),
+            "permission_mode": base.get("permission_mode"),
+            "workspace_title": base.get("workspace_title") or current.get("workspace_title"),
+            "normalized_title": base.get("normalized_title") or current.get("normalized_title"),
+            "workspace_id": current.get("workspace_id"),
+            "workspace_ref": current.get("workspace_ref"),
+            "workspace_index": current.get("workspace_index"),
+            "surface_id": current.get("surface_id"),
+            "surface_ref": current.get("surface_ref"),
+            "tab_id": current.get("tab_id"),
+            "pane_id": current.get("pane_id"),
+            "process_title": base.get("process_title"),
+            "tty": current.get("tty"),
+            "payload_json": base.get("payload_json"),
+            "score": 20000 - idx,
+            "pinned": False,
+            "current_screen_resume": True,
+            "title_match": title_matches(current.get("normalized_title"), base.get("normalized_title"), base.get("workspace_title")),
+            "surface_match": True,
+            "workspace_id_match": True,
+            "workspace_ref_match": True,
+            "index_match": False,
+            "cwd_match": same_path(current.get("current_directory"), base.get("cwd")),
+        }
+        item["resume_cwd"] = str(candidate_cwd(item))
+        item["resume_cwd_match"] = same_path(current.get("current_directory"), item.get("resume_cwd"))
+        item["process_title_topic_match"] = False
+        item.update(transcript_info(item.get("transcript_path")))
+        item.update(topic_match_info(current, item))
+        item["command"] = resume_command(item)
+        candidates.append(item)
+    for item in candidates:
+        if (item["tool"], item["session_id"]) in screen_ref_keys:
+            item["current_screen_resume"] = True
+    if screen_snippets and not screen_refs:
+        for row in session_binding_rows(
+            con,
+            "sb.transcript_path IS NOT NULL AND sb.transcript_path != ''",
+            (),
+            limit=SCREEN_TRANSCRIPT_SCAN_LIMIT,
+        ):
+            match = screen_transcript_match_info(screen_snippets, row["transcript_path"])
+            if int(match.get("screen_match_score") or 0) <= 0:
+                continue
+            existing = next(
+                (item for item in candidates if item["tool"] == row["tool"] and item["session_id"] == row["session_id"]),
+                None,
+            )
+            if existing:
+                existing["current_screen_transcript_match"] = True
+                existing.update(match)
+                existing["score"] = max(int(existing.get("score") or 0), 19000 + int(match["screen_match_score"]))
+                continue
+            item = dict(row)
+            item["pinned"] = False
+            item["title_match"] = title_matches(current.get("normalized_title"), item.get("normalized_title"), item.get("workspace_title"))
+            item["surface_match"] = bool(current.get("surface_id") and current.get("surface_id") == item.get("surface_id"))
+            item["workspace_id_match"] = bool(current.get("workspace_id") and current.get("workspace_id") == item.get("workspace_id"))
+            item["workspace_ref_match"] = bool(current.get("workspace_ref") and current.get("workspace_ref") == item.get("workspace_ref"))
+            item["index_match"] = bool(
+                current.get("workspace_index") is not None
+                and item.get("workspace_index") is not None
+                and current.get("workspace_index") == item.get("workspace_index")
+            )
+            item["cwd_match"] = same_path(current.get("current_directory"), item.get("cwd"))
+            item["resume_cwd"] = str(candidate_cwd(item))
+            item["resume_cwd_match"] = same_path(current.get("current_directory"), item.get("resume_cwd"))
+            item["process_title_topic_match"] = False
+            item["current_screen_transcript_match"] = True
+            item.update(transcript_info(item.get("transcript_path")))
+            item.update(topic_match_info(current, item))
+            item.update(match)
+            item["score"] = 19000 + int(match["screen_match_score"])
+            item["command"] = resume_command(item)
+            candidates.append(item)
     if pin and not any(item["tool"] == pin["tool"] and item["session_id"] == pin["session_id"] for item in candidates):
         item = {
             "tool": pin["tool"],
@@ -1383,6 +1541,19 @@ def session_binding_rows(
         """,
         (*params, limit),
     ).fetchall()
+
+
+def session_binding_row(con: sqlite3.Connection, tool: str, session_id: str) -> sqlite3.Row | None:
+    return con.execute(
+        """
+        SELECT sb.* FROM session_bindings sb
+        LEFT JOIN ignored_sessions ig
+          ON ig.tool = sb.tool AND ig.session_id = sb.session_id
+        WHERE sb.tool = ? AND sb.session_id = ?
+          AND ig.session_id IS NULL
+        """,
+        (tool, session_id),
+    ).fetchone()
 
 
 def candidate_rows(con: sqlite3.Connection, current: dict[str, Any]) -> list[sqlite3.Row]:
@@ -1583,6 +1754,99 @@ def user_text_from_transcript_object(obj: dict[str, Any]) -> str:
     return ""
 
 
+def transcript_text_from_object(obj: dict[str, Any]) -> str:
+    payload = obj.get("payload")
+    if isinstance(payload, dict):
+        for key in ("message", "text", "output", "arguments"):
+            if payload.get(key):
+                return text_from_content(payload.get(key))
+        if payload.get("type") == "message":
+            return text_from_content(payload.get("content"))
+    return user_text_from_transcript_object(obj)
+
+
+def recent_transcript_text(value: str | None, *, max_bytes: int = 2_000_000) -> str:
+    if not value:
+        return ""
+    path = Path(value).expanduser()
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+                handle.readline()
+            raw = handle.read(max_bytes)
+    except OSError:
+        return ""
+    text_parts: list[str] = []
+    for raw_line in raw.decode("utf-8", errors="replace").splitlines():
+        try:
+            obj = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        text = re.sub(r"\s+", " ", transcript_text_from_object(obj)).strip()
+        if text:
+            text_parts.append(text[:2000])
+    return "\n".join(text_parts)[-120_000:]
+
+
+def normalize_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9_.:/-]+", " ", value.lower()).strip()
+
+
+def screen_match_snippets(screen_text: str) -> list[str]:
+    ignored = (
+        "cmr:",
+        "last login:",
+        "robertgrzesik@",
+        "press ctrl",
+        "debug log",
+        "original token count",
+        "wall time:",
+        "process exited",
+        "process running",
+        "chunk id:",
+    )
+    snippets: list[str] = []
+    seen: set[str] = set()
+    for raw_line in screen_text.splitlines():
+        line = raw_line.strip(" │└─•⏺■*`'\"")
+        lower = line.lower()
+        if len(line) < 42 or any(marker in lower for marker in ignored):
+            continue
+        if sum(ch.isalpha() for ch in line) < 20:
+            continue
+        normalized = normalize_match_text(line)
+        words = normalized.split()
+        if len(words) < 6:
+            continue
+        snippet = " ".join(words[:24])
+        if len(snippet) < 42 or snippet in seen:
+            continue
+        seen.add(snippet)
+        snippets.append(snippet)
+    snippets.sort(key=len, reverse=True)
+    return snippets[:40]
+
+
+def screen_transcript_match_info(snippets: list[str], transcript_path: str | None) -> dict[str, Any]:
+    if not snippets or not transcript_path:
+        return {"screen_match_score": 0, "screen_match_hits": []}
+    transcript = normalize_match_text(recent_transcript_text(transcript_path))
+    if not transcript:
+        return {"screen_match_score": 0, "screen_match_hits": []}
+    hits: list[str] = []
+    for snippet in snippets:
+        if snippet in transcript:
+            hits.append(snippet)
+        if len(hits) >= 5:
+            break
+    if len(hits) < 2 and not any(len(hit) >= 90 for hit in hits):
+        return {"screen_match_score": 0, "screen_match_hits": hits}
+    score = min(900, sum(min(180, len(hit)) for hit in hits))
+    return {"screen_match_score": score, "screen_match_hits": hits}
+
+
 def resume_command(candidate: dict[str, Any]) -> str:
     cwd = str(candidate_cwd(candidate))
     sid = str(candidate["session_id"])
@@ -1601,11 +1865,12 @@ def print_candidates(candidates: list[dict[str, Any]], limit: int = 8) -> None:
             size = f" transcript={int(item['transcript_bytes']) / 1024 / 1024:.1f}MB"
         prompt = item.get("first_user_prompt")
         pin = " pinned" if item.get("pinned") else ""
+        screen = " screen" if item.get("current_screen_resume") or item.get("current_screen_transcript_match") else ""
         topic = ""
         if item.get("topic_relevance") or item.get("topic_penalty"):
             topic = f" topic=+{int(item.get('topic_relevance') or 0)}/-{int(item.get('topic_penalty') or 0)}"
         print(
-            f"{idx}. {item['tool']}{pin} session={item.get('session_id')} score={item['score']} last={item.get('last_seen')} "
+            f"{idx}. {item['tool']}{pin}{screen} session={item.get('session_id')} score={item['score']} last={item.get('last_seen')} "
             f"title={title!r} cwd={cwd} resume_cwd={resume_cwd}{size}{topic}"
         )
         if prompt:
@@ -1628,6 +1893,7 @@ def public_current_summary(current: dict[str, Any]) -> dict[str, Any]:
         "surface_ref",
         "tty",
         "current_directory",
+        "screen_resume_refs",
     ]
     return {key: current.get(key) for key in keys}
 
@@ -1657,6 +1923,10 @@ def public_candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
         "cwd_match",
         "resume_cwd_match",
         "process_title_topic_match",
+        "current_screen_resume",
+        "current_screen_transcript_match",
+        "screen_match_score",
+        "screen_match_hits",
         "pinned",
         "transcript_path",
         "transcript_exists",
@@ -1745,6 +2015,10 @@ def log_restore(
 
 
 def strong_candidate_match(item: dict[str, Any]) -> bool:
+    if item.get("current_screen_resume"):
+        return True
+    if item.get("current_screen_transcript_match"):
+        return True
     strong_keys = ("surface_match", "workspace_id_match", "workspace_ref_match", "cwd_match", "resume_cwd_match", "index_match")
     return any(item.get(key) for key in strong_keys)
 
@@ -1764,6 +2038,8 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
     top = candidates[0]
     if not viable_candidate(top):
         return "missing", None
+    if top.get("current_screen_resume"):
+        return "selected", top
     second = candidates[1] if len(candidates) > 1 else None
     top_strong = strong_candidate_match(top)
     second_title_match = bool(second and second.get("title_match"))
@@ -2024,6 +2300,8 @@ def cmd_recover(args: argparse.Namespace) -> int:
             current["current_directory"] = str(DEFAULT_RESTORE_CWD)
         if not current.get("normalized_title"):
             current["normalized_title"] = normalize_title(current.get("workspace_title"))
+        current["screen_text"] = read_screen_text(current)
+        current["screen_resume_refs"] = screen_resume_refs_from_text(current["screen_text"])
         candidates = load_candidates(con, current)
         status, selected = choose_candidate(args, candidates)
         debug_path = write_recover_debug_log(

@@ -95,6 +95,8 @@ class RecoveryCliTests(unittest.TestCase):
                     print(identify_json)
                 elif "tree" in args:
                     print(os.environ.get("CMUX_FAKE_TREE_JSON", tree_json))
+                elif "read-screen" in args:
+                    print(os.environ.get("CMUX_FAKE_SCREEN_TEXT", ""))
                 elif "reload-config" in args:
                     print("OK Reloaded config")
                 elif "respawn-pane" in args:
@@ -436,6 +438,135 @@ class RecoveryCliTests(unittest.TestCase):
         recovered = self.run_cli("recover", "--dry-run")
         self.assertEqual(recovered.returncode, 2)
         self.assertIn("no recoverable", recovered.stdout)
+
+    def test_current_screen_resume_command_overrides_poisoned_title(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "CX - Bug: New Leads Missing How Found"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+        screen_session = "019e0d99-96a0-7800-a6ee-32d651afad79"
+        self.env["CMUX_FAKE_SCREEN_TEXT"] = (
+            "Resume this session with:\n"
+            "claude --resume 98057358-d9ce-4d4b-a752-233a16dc147b\n"
+            f"To continue this session, run codex resume {screen_session}"
+        )
+
+        poisoned = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={
+                "session_id": "claude-linkedin-title-poison",
+                "cwd": str(self.restore_cwd / "MarketingManager"),
+                "prompt": "You are a LinkedIn outreach agent. This is Step 9: ACCEPT INCOMING CONNECTION REQUESTS.",
+            },
+        )
+        self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn(f"codex -C {self.restore_cwd} resume {screen_session}", recovered.stdout)
+        self.assertNotIn("claude-linkedin-title-poison", recovered.stdout)
+
+    def test_cosmetic_cx_prefix_still_matches_exact_title(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "🚀 CX - Paraxanthine"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        recorded = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "Stop",
+            input_json={
+                "session_id": "claude-paraxanthine-session",
+                "cwd": str(self.restore_cwd),
+                "transcript_path": str(self.base / "claude-paraxanthine-session.jsonl"),
+            },
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_title='🚀 Paraxanthine', normalized_title='paraxanthine',
+                    workspace_id='old-workspace', surface_id='old-surface'
+                WHERE session_id='claude-paraxanthine-session'
+                """
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("claude --resume claude-paraxanthine-session", recovered.stdout)
+
+    def test_current_screen_transcript_text_recovers_codex_without_resume_line(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "CX - OpenAI Credits"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+        self.env["CMUX_FAKE_SCREEN_TEXT"] = (
+            "Done. Switched BotSpot Agent to openai/gpt-5.4-mini locally and in the production workflow, "
+            "fixed the Agent token aggregation bug."
+        )
+
+        state = self.base / "codex-state.sqlite"
+        self.env["CMUX_CODEX_STATE"] = str(state)
+        rollout = self.base / "rollout-openai-credits.jsonl"
+        rollout.write_text(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": (
+                            "Done. Switched BotSpot Agent to openai/gpt-5.4-mini locally and in the production workflow, "
+                            "fixed the Agent token aggregation bug."
+                        ),
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with sqlite3.connect(state) as con:
+            con.execute(
+                "CREATE TABLE threads (id TEXT, updated_at INTEGER, cwd TEXT, rollout_path TEXT, title TEXT, model TEXT, approval_mode TEXT, sandbox_policy TEXT, archived INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "019e17db-f3aa-7cf2-972d-e0c52e1c9781",
+                    2000000000,
+                    str(self.restore_cwd),
+                    str(rollout),
+                    None,
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+
+        poisoned = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={
+                "session_id": "claude-openai-credits-poison",
+                "cwd": str(self.restore_cwd / "MarketingManager"),
+                "prompt": "You are a LinkedIn outreach agent. This is Step 1: CHECK MESSAGES AND NEW ACCEPTANCES.",
+            },
+        )
+        self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex -C", recovered.stdout)
+        self.assertIn("019e17db-f3aa-7cf2-972d-e0c52e1c9781", recovered.stdout)
+        self.assertNotIn("claude-openai-credits-poison", recovered.stdout)
 
     def test_codex_state_topic_match_does_not_recover_without_exact_title(self) -> None:
         tree = json.loads(json.dumps(TREE))
