@@ -496,7 +496,7 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 2)
         self.assertIn("no recoverable", recovered.stdout)
 
-    def test_current_screen_resume_command_overrides_poisoned_title(self) -> None:
+    def test_current_screen_resume_without_known_title_does_not_override_title(self) -> None:
         tree = json.loads(json.dumps(TREE))
         tree["windows"][0]["workspaces"][0]["title"] = "CX - Bug: New Leads Missing How Found"
         self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
@@ -522,9 +522,41 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
 
         recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 2, recovered.stderr)
+        self.assertIn("no recoverable", recovered.stdout)
+        self.assertNotIn(f"codex -C {self.restore_cwd} resume {screen_session}", recovered.stdout)
+        self.assertNotIn("claude-linkedin-title-poison", recovered.stdout)
+
+    def test_current_screen_resume_with_matching_known_title_can_override(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "CX - Bug: New Leads Missing How Found"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+        screen_session = "019e0d99-96a0-7800-a6ee-32d651afad79"
+        self.env["CMUX_FAKE_SCREEN_TEXT"] = f"To continue this session, run codex resume {screen_session}"
+
+        recorded = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": screen_session, "cwd": str(self.restore_cwd), "prompt": "real bug session"},
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_title='CX - Bug: New Leads Missing How Found',
+                    normalized_title='cx bug new leads missing how found'
+                WHERE session_id=?
+                """,
+                (screen_session,),
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertIn(f"codex -C {self.restore_cwd} resume {screen_session}", recovered.stdout)
-        self.assertNotIn("claude-linkedin-title-poison", recovered.stdout)
 
     def test_current_screen_resume_conflicting_known_title_is_ignored(self) -> None:
         tree = json.loads(json.dumps(TREE))

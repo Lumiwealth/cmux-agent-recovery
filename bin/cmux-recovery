@@ -157,7 +157,7 @@ def screen_resume_title_allowed(current: dict[str, Any], item: dict[str, Any]) -
         return True
     candidate_has_title = bool(title_match_keys(item.get("normalized_title")) | title_match_keys(item.get("workspace_title")))
     if not candidate_has_title:
-        return True
+        return False
     return title_matches(current.get("normalized_title"), item.get("normalized_title"), item.get("workspace_title"))
 
 
@@ -1404,6 +1404,8 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             continue
         row = session_binding_row(con, ref["tool"], ref["session_id"])
         base = dict(row) if row else {}
+        if current.get("normalized_title") and not base:
+            continue
         if base and not screen_resume_title_allowed(current, base):
             continue
         item = {
