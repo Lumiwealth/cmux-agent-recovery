@@ -1715,12 +1715,23 @@ def transcript_info(value: str | None) -> dict[str, Any]:
                     continue
                 content = user_text_from_transcript_object(obj)
                 text = re.sub(r"\s+", " ", str(content or "")).strip()
-                if text:
+                if text and not transcript_prompt_noise(text):
                     info["first_user_prompt"] = text[:220]
                     break
     except OSError:
         pass
     return info
+
+
+def transcript_prompt_noise(text: str) -> bool:
+    normalized = text.strip().lower()
+    return (
+        normalized.startswith("# agents.md instructions")
+        or normalized.startswith("knowledge cutoff:")
+        or normalized.startswith("<environment_context>")
+        or "<instructions>" in normalized[:500]
+        or "# project-doc" in normalized[:500]
+    )
 
 
 def text_from_content(value: Any) -> str:

@@ -217,6 +217,63 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn(f"cd {self.restore_cwd}", recovered.stdout)
         self.assertIn(f"codex -C {self.restore_cwd} resume codex-session-1", recovered.stdout)
 
+    def test_codex_candidate_prompt_skips_agents_instructions(self) -> None:
+        transcript = self.base / "codex-session-instructions.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "# AGENTS.md instructions for /Users/robertgrzesik/Development <INSTRUCTIONS> lots of rules",
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "i want you to take over from claude code and fix the welcome sequence bug",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        recorded = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "codex-session-instructions", "cwd": str(self.restore_cwd), "transcript_path": str(transcript)},
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+        other = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "codex-session-other", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(other.returncode, 0, other.stderr)
+
+        recovered = self.run_cli("recover", "1", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+
+        ambiguous = self.run_cli("recover", "--dry-run")
+        self.assertIn("i want you to take over from claude code", ambiguous.stdout)
+        self.assertNotIn("AGENTS.md instructions", ambiguous.stdout)
+
     def test_ambiguous_matches_require_choice(self) -> None:
         for session_id in ["claude-old", "claude-new"]:
             recorded = self.run_cli(
