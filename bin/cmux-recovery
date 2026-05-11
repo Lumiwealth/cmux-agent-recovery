@@ -152,6 +152,15 @@ def title_matches(current_title: str | None, candidate_title: str | None, candid
     return bool(current_keys and candidate_keys and current_keys & candidate_keys)
 
 
+def screen_resume_title_allowed(current: dict[str, Any], item: dict[str, Any]) -> bool:
+    if not current.get("normalized_title"):
+        return True
+    candidate_has_title = bool(title_match_keys(item.get("normalized_title")) | title_match_keys(item.get("workspace_title")))
+    if not candidate_has_title:
+        return True
+    return title_matches(current.get("normalized_title"), item.get("normalized_title"), item.get("workspace_title"))
+
+
 def title_terms(value: str | None) -> list[str]:
     terms: list[str] = []
     seen: set[str] = set()
@@ -1389,11 +1398,14 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
         if any(item["tool"] == ref["tool"] and item["session_id"] == ref["session_id"] for item in candidates):
             for item in candidates:
                 if item["tool"] == ref["tool"] and item["session_id"] == ref["session_id"]:
-                    item["current_screen_resume"] = True
-                    item["score"] = max(int(item.get("score") or 0), 20000 - idx)
+                    if screen_resume_title_allowed(current, item):
+                        item["current_screen_resume"] = True
+                        item["score"] = max(int(item.get("score") or 0), 20000 - idx)
             continue
         row = session_binding_row(con, ref["tool"], ref["session_id"])
         base = dict(row) if row else {}
+        if base and not screen_resume_title_allowed(current, base):
+            continue
         item = {
             "tool": ref["tool"],
             "session_id": ref["session_id"],
@@ -1435,7 +1447,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
         item["command"] = resume_command(item)
         candidates.append(item)
     for item in candidates:
-        if (item["tool"], item["session_id"]) in screen_ref_keys:
+        if (item["tool"], item["session_id"]) in screen_ref_keys and screen_resume_title_allowed(current, item):
             item["current_screen_resume"] = True
     if screen_snippets and not screen_refs:
         for row in session_binding_rows(

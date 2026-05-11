@@ -526,6 +526,57 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn(f"codex -C {self.restore_cwd} resume {screen_session}", recovered.stdout)
         self.assertNotIn("claude-linkedin-title-poison", recovered.stdout)
 
+    def test_current_screen_resume_conflicting_known_title_is_ignored(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "(CX) ⏳ 🧾 Taxes"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+        self.env["CMUX_FAKE_SCREEN_TEXT"] = (
+            "Resume this session with:\n"
+            "claude --resume claude-client-christy"
+        )
+
+        stale = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "claude-client-christy", "cwd": str(self.restore_cwd / "MarketingManager")},
+        )
+        self.assertEqual(stale.returncode, 0, stale.stderr)
+        taxes = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "codex-taxes-session", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(taxes.returncode, 0, taxes.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_title='(CX) 💰🚀 Client - Christy',
+                    normalized_title='cx client christy'
+                WHERE session_id='claude-client-christy'
+                """
+            )
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_id='old-workspace', workspace_ref='old-workspace-ref',
+                    surface_id='old-surface', surface_ref='old-surface-ref',
+                    last_seen='2026-04-30T02:44:43Z'
+                WHERE session_id='codex-taxes-session'
+                """
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex-taxes-session", recovered.stdout)
+        self.assertNotIn("claude-client-christy", recovered.stdout)
+
     def test_cosmetic_cx_prefix_still_matches_exact_title(self) -> None:
         tree = json.loads(json.dumps(TREE))
         tree["windows"][0]["workspaces"][0]["title"] = "🚀 CX - Paraxanthine"
