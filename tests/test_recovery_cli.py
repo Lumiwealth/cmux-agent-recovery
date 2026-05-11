@@ -488,6 +488,60 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("codex-fargate-deploy", recovered.stdout)
         self.assertNotIn("claude-linkedin-content-poison", recovered.stdout)
 
+    def test_exact_posthog_title_beats_broad_topic_match(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "Sales - PostHog Recordings Review"
+        tree["windows"][0]["workspaces"][0]["index"] = 98
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        state = self.base / "codex-state.sqlite"
+        self.env["CMUX_CODEX_STATE"] = str(state)
+        with sqlite3.connect(state) as con:
+            con.execute(
+                "CREATE TABLE threads (id TEXT, updated_at INTEGER, cwd TEXT, rollout_path TEXT, title TEXT, model TEXT, approval_mode TEXT, sandbox_policy TEXT, archived INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-broad-posthog",
+                    2000000000,
+                    str(self.restore_cwd),
+                    str(self.base / "missing-rollout.jsonl"),
+                    "Review PostHog funnel notes",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+
+        exact = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={
+                "session_id": "claude-posthog-recordings",
+                "cwd": str(self.restore_cwd),
+                "prompt": "Review the PostHog recordings and summarize sales friction.",
+            },
+        )
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET normalized_title='sales posthog recordings review'
+                WHERE session_id='claude-posthog-recordings'
+                """
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("claude-posthog-recordings", recovered.stdout)
+        self.assertNotIn("codex-broad-posthog", recovered.stdout)
+
     def test_pin_overrides_poisoned_current_workspace_match(self) -> None:
         poisoned = self.run_cli(
             "record",
