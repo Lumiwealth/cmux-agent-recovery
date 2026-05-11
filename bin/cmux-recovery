@@ -23,6 +23,56 @@ DEFAULT_LATEST_JSON = ROOT / "state" / "latest.json"
 DEFAULT_RESTORE_CWD = Path(os.environ.get("CMUX_RESTORE_CWD", "~/Development")).expanduser()
 DEFAULT_CMUX_BIN = Path("/Applications/cmux.app/Contents/Resources/bin/cmux")
 DEFAULT_DEBUG_DIR = ROOT / "logs"
+TITLE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "be",
+    "bug",
+    "client",
+    "could",
+    "cx",
+    "for",
+    "found",
+    "how",
+    "in",
+    "missing",
+    "new",
+    "of",
+    "on",
+    "sales",
+    "the",
+    "to",
+}
+GENERIC_OUTREACH_TITLE_TERMS = {
+    "connection",
+    "connections",
+    "dm",
+    "dms",
+    "email",
+    "emails",
+    "inbox",
+    "lead",
+    "leads",
+    "linkedin",
+    "message",
+    "messages",
+    "outreach",
+    "prospect",
+    "prospects",
+    "reply",
+    "sequence",
+    "welcome",
+}
+GENERIC_WORKFLOW_MARKERS = (
+    "linkedin outreach agent",
+    "linkedin engagement agent",
+    "accept incoming connection requests",
+    "combined inbox check",
+    "reply to active conversations",
+    "send connection requests",
+    "check profile viewers",
+)
 SESSION_ID_RE = re.compile(
     r"\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,}-[0-9a-f-]{20,})\b",
     re.IGNORECASE,
@@ -52,6 +102,18 @@ def normalize_title(value: str | None) -> str:
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"[^0-9a-z]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def title_terms(value: str | None) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in normalize_title(value).split():
+        if len(term) < 3 or term in TITLE_STOPWORDS:
+            continue
+        if term not in seen:
+            seen.add(term)
+            terms.append(term)
+    return terms
 
 
 def clean(value: Any) -> str | None:
@@ -603,6 +665,15 @@ def upsert_event(con: sqlite3.Connection, row: dict[str, Any]) -> None:
     )
     if not row.get("session_id"):
         return
+    existing = con.execute(
+        """
+        SELECT 1 FROM session_bindings
+        WHERE tool = ? AND session_id = ?
+        """,
+        (row["tool"], row["session_id"]),
+    ).fetchone()
+    if existing and str(row.get("event") or "") == "SessionStart":
+        return
     con.execute(
         """
         INSERT INTO session_bindings (
@@ -1138,6 +1209,11 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
         item["resume_cwd"] = str(candidate_cwd(item))
         item["resume_cwd_match"] = same_path(current.get("current_directory"), item.get("resume_cwd"))
         item.update(transcript_info(item.get("transcript_path")))
+        topic = topic_match_info(current, item)
+        item.update(topic)
+        score += int(topic.get("topic_relevance") or 0)
+        score -= int(topic.get("topic_penalty") or 0)
+        item["score"] = score
         item["command"] = resume_command(item)
         candidates.append(item)
     if pin and not any(item["tool"] == pin["tool"] and item["session_id"] == pin["session_id"] for item in candidates):
@@ -1244,6 +1320,57 @@ def candidate_rows(con: sqlite3.Connection, current: dict[str, Any]) -> list[sql
     if clauses:
         add(session_binding_rows(con, " OR ".join(clauses), tuple(params), limit=1000))
     return rows
+
+
+def payload_value_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in ["prompt", "message", "content", "text", "last_assistant_message", "summary", "command"]:
+            if key in value:
+                parts.append(payload_value_text(value.get(key)))
+        return " ".join(part for part in parts if part)
+    if isinstance(value, list):
+        return " ".join(payload_value_text(item) for item in value)
+    return ""
+
+
+def candidate_topic_text(candidate: dict[str, Any]) -> str:
+    parts = [
+        candidate.get("process_title") or "",
+        candidate.get("first_user_prompt") or "",
+    ]
+    raw_payload = candidate.get("payload_json")
+    if raw_payload:
+        try:
+            payload = json.loads(str(raw_payload))
+        except json.JSONDecodeError:
+            payload = {}
+        parts.append(payload_value_text(payload))
+    return " ".join(part for part in parts if part)
+
+
+def topic_match_info(current: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    if not candidate.get("title_match"):
+        return {"topic_relevance": 0, "topic_penalty": 0, "topic_terms": [], "topic_hits": []}
+    terms = title_terms(current.get("normalized_title") or current.get("workspace_title"))
+    if not terms:
+        return {"topic_relevance": 0, "topic_penalty": 0, "topic_terms": [], "topic_hits": []}
+    text = candidate_topic_text(candidate)
+    normalized_text = normalize_title(text)
+    hits = [term for term in terms if re.search(rf"\b{re.escape(term)}\b", normalized_text)]
+    relevance = min(72, len(hits) * 18)
+    marker_text = text.lower()
+    generic_workflow = any(marker in marker_text for marker in GENERIC_WORKFLOW_MARKERS)
+    title_is_generic_outreach = bool(terms) and all(term in GENERIC_OUTREACH_TITLE_TERMS for term in terms)
+    penalty = 300 if generic_workflow and not title_is_generic_outreach else 0
+    return {
+        "topic_relevance": relevance,
+        "topic_penalty": penalty,
+        "topic_terms": terms,
+        "topic_hits": hits,
+    }
 
 
 def usable_cwd(value: str | None) -> Path:
@@ -1364,9 +1491,12 @@ def print_candidates(candidates: list[dict[str, Any]], limit: int = 8) -> None:
             size = f" transcript={int(item['transcript_bytes']) / 1024 / 1024:.1f}MB"
         prompt = item.get("first_user_prompt")
         pin = " pinned" if item.get("pinned") else ""
+        topic = ""
+        if item.get("topic_relevance") or item.get("topic_penalty"):
+            topic = f" topic=+{int(item.get('topic_relevance') or 0)}/-{int(item.get('topic_penalty') or 0)}"
         print(
             f"{idx}. {item['tool']}{pin} session={item.get('session_id')} score={item['score']} last={item.get('last_seen')} "
-            f"title={title!r} cwd={cwd} resume_cwd={resume_cwd}{size}"
+            f"title={title!r} cwd={cwd} resume_cwd={resume_cwd}{size}{topic}"
         )
         if prompt:
             print(f"   first_user={prompt!r}")
@@ -1421,6 +1551,10 @@ def public_candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
         "transcript_bytes",
         "first_user_prompt",
         "command",
+        "topic_relevance",
+        "topic_penalty",
+        "topic_terms",
+        "topic_hits",
     ]
     return {key: item.get(key) for key in keys}
 

@@ -353,6 +353,59 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertIn("codex-old-release-notes", recovered.stdout)
 
+    def test_topic_relevance_beats_generic_outreach_poison(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "Sales - CX - Trading Agents 54k Stars Could Be Lumibot"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        codex = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={
+                "session_id": "codex-trading-agents",
+                "cwd": str(self.restore_cwd),
+                "last_assistant_message": "TradingAgents and Lumibot plan for a 54k stars GitHub launch.",
+            },
+        )
+        self.assertEqual(codex.returncode, 0, codex.stderr)
+        linkedin = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={
+                "session_id": "claude-linkedin-poison",
+                "cwd": str(self.restore_cwd / "MarketingManager"),
+                "prompt": "You are a LinkedIn outreach agent. This is Step 3a: REPLY TO ACTIVE CONVERSATIONS for proprietary trading contacts.",
+            },
+        )
+        self.assertEqual(linkedin.returncode, 0, linkedin.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET last_seen='2026-05-01T00:00:00Z',
+                    workspace_id='old-workspace', surface_id='old-surface'
+                WHERE session_id='codex-trading-agents'
+                """
+            )
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET last_seen='2026-05-11T00:00:00Z'
+                WHERE session_id='claude-linkedin-poison'
+                """
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex-trading-agents", recovered.stdout)
+        self.assertNotIn("claude-linkedin-poison", recovered.stdout)
+
     def test_pin_overrides_poisoned_current_workspace_match(self) -> None:
         poisoned = self.run_cli(
             "record",
@@ -409,6 +462,42 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertIn("claude-keep-me", recovered.stdout)
         self.assertNotIn("claude-ignore-me", recovered.stdout)
+
+    def test_session_start_does_not_rebind_existing_session(self) -> None:
+        recorded = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "claude-stable-binding", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stderr)
+
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "Taxes"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+        started = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "SessionStart",
+            input_json={"session_id": "claude-stable-binding", "cwd": str(self.restore_cwd), "source": "resume"},
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+
+        with sqlite3.connect(self.db) as con:
+            row = con.execute(
+                """
+                SELECT workspace_title, normalized_title, last_event
+                FROM session_bindings
+                WHERE tool='claude' AND session_id='claude-stable-binding'
+                """
+            ).fetchone()
+        self.assertEqual(row[0], "Release Notes")
+        self.assertEqual(row[1], "release notes")
+        self.assertEqual(row[2], "UserPromptSubmit")
 
     def test_missing_match_does_not_start_plain_agent(self) -> None:
         recovered = self.run_cli("recover", "--dry-run")
