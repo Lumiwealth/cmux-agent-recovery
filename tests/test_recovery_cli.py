@@ -269,7 +269,7 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("multiple possible sessions", recovered.stdout)
         self.assertIn("claude-new-title-only", recovered.stdout)
 
-    def test_title_only_recency_gap_can_auto_select_newest_same_cwd(self) -> None:
+    def test_title_only_recency_gap_still_requires_choice(self) -> None:
         shared_cwd = self.base / "shared-title-work"
         shared_cwd.mkdir()
         for session_id in ["claude-old-title-gap", "claude-new-title-gap"]:
@@ -303,9 +303,10 @@ class RecoveryCliTests(unittest.TestCase):
             )
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(recovered.returncode, 3)
+        self.assertIn("multiple possible sessions", recovered.stdout)
         self.assertIn("claude-new-title-gap", recovered.stdout)
-        self.assertNotIn("claude-old-title-gap", recovered.stdout)
+        self.assertIn("claude-old-title-gap", recovered.stdout)
 
     def test_old_matching_title_is_not_lost_behind_recent_global_limit(self) -> None:
         old = self.run_cli(

@@ -23,7 +23,6 @@ DEFAULT_LATEST_JSON = ROOT / "state" / "latest.json"
 DEFAULT_RESTORE_CWD = Path(os.environ.get("CMUX_RESTORE_CWD", "~/Development")).expanduser()
 DEFAULT_CMUX_BIN = Path("/Applications/cmux.app/Contents/Resources/bin/cmux")
 DEFAULT_DEBUG_DIR = ROOT / "logs"
-TITLE_ONLY_AUTO_SELECT_GAP_SECONDS = 15 * 60
 SESSION_ID_RE = re.compile(
     r"\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,}-[0-9a-f-]{20,})\b",
     re.IGNORECASE,
@@ -1366,7 +1365,7 @@ def print_candidates(candidates: list[dict[str, Any]], limit: int = 8) -> None:
         prompt = item.get("first_user_prompt")
         pin = " pinned" if item.get("pinned") else ""
         print(
-            f"{idx}. {item['tool']}{pin} score={item['score']} last={item.get('last_seen')} "
+            f"{idx}. {item['tool']}{pin} session={item.get('session_id')} score={item['score']} last={item.get('last_seen')} "
             f"title={title!r} cwd={cwd} resume_cwd={resume_cwd}{size}"
         )
         if prompt:
@@ -1504,23 +1503,6 @@ def strong_candidate_match(item: dict[str, Any]) -> bool:
     return any(item.get(key) for key in strong_keys)
 
 
-def can_auto_select_title_only(top: dict[str, Any], second: dict[str, Any] | None) -> bool:
-    if not second:
-        return False
-    if not top.get("title_match") or not second.get("title_match"):
-        return False
-    if strong_candidate_match(top) or strong_candidate_match(second):
-        return False
-    if top.get("tool") != second.get("tool"):
-        return False
-    if not same_path(top.get("resume_cwd"), second.get("resume_cwd")):
-        return False
-    if normalize_title(top.get("workspace_title")) != normalize_title(second.get("workspace_title")):
-        return False
-    gap = parse_time(top.get("last_seen")) - parse_time(second.get("last_seen"))
-    return gap >= TITLE_ONLY_AUTO_SELECT_GAP_SECONDS
-
-
 def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
     if args.choice is not None:
         index = args.choice - 1
@@ -1534,8 +1516,6 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
     top_strong = strong_candidate_match(top)
     second_title_match = bool(second and second.get("title_match"))
     if top.get("title_match") and not top_strong and second_title_match:
-        if can_auto_select_title_only(top, second):
-            return "selected", top
         return "ambiguous", None
     if top["score"] >= 75 and (second is None or top["score"] - second["score"] >= 20):
         return "selected", top
