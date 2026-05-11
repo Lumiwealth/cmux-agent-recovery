@@ -1224,26 +1224,10 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
     cwd_match = same_path(current.get("current_directory"), candidate["cwd"])
     resume_cwd = candidate_cwd(dict(candidate))
     resume_cwd_match = same_path(current.get("current_directory"), str(resume_cwd))
-    process_title_hits = topic_hits_for_title(
-        current.get("normalized_title") or current.get("workspace_title"),
-        candidate["process_title"],
-    )
-    process_title_topic_match = bool(
-        (cwd_match or resume_cwd_match)
-        and process_title_hits
-        and substantial_topic_hits(process_title_hits)
-    )
 
-    # Title text is matched literally. User-defined title markers may make a
-    # title more unique, but they are not interpreted as tool metadata.
-    if not (
-        title_match
-        or surface_match
-        or workspace_id_match
-        or workspace_ref_match
-        or index_match
-        or process_title_topic_match
-    ):
+    # The tab title is the source of truth. Workspace/surface IDs and topic
+    # text only help rank candidates after the title matches exactly.
+    if not title_match:
         return 0
 
     if surface_match:
@@ -1260,8 +1244,6 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
         score += 35
     if index_match:
         score += 8
-    if process_title_topic_match:
-        score += 55 + min(45, len(process_title_hits) * 15)
     age = max(0.0, time.time() - parse_time(candidate["last_seen"]))
     if age < 6 * 60 * 60:
         score += 25
@@ -1318,31 +1300,13 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
         item["cwd_match"] = same_path(current.get("current_directory"), item.get("cwd"))
         item["resume_cwd"] = str(candidate_cwd(item))
         item["resume_cwd_match"] = same_path(current.get("current_directory"), item.get("resume_cwd"))
-        item["process_title_topic_match"] = bool(
-            (item["cwd_match"] or item["resume_cwd_match"])
-            and substantial_topic_hits(
-                topic_hits_for_title(
-                    current.get("normalized_title") or current.get("workspace_title"),
-                    item.get("process_title"),
-                )
-            )
-        )
+        item["process_title_topic_match"] = False
         item.update(transcript_info(item.get("transcript_path")))
         topic = topic_match_info(current, item)
         item.update(topic)
         if score <= 0:
             if pinned:
                 score = 1
-            elif (
-                (item["cwd_match"] or item["resume_cwd_match"])
-                and topic.get("topic_hits")
-                and substantial_topic_hits(list(topic.get("topic_hits") or []))
-            ):
-                score = 50
-                if item["cwd_match"]:
-                    score += 25
-                elif item["resume_cwd_match"]:
-                    score += 35
             else:
                 continue
         if pinned:
@@ -1492,6 +1456,8 @@ def candidate_topic_text(candidate: dict[str, Any]) -> str:
 
 
 def topic_match_info(current: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    if not candidate.get("title_match"):
+        return {"topic_relevance": 0, "topic_penalty": 0, "topic_terms": [], "topic_hits": []}
     title = current.get("normalized_title") or current.get("workspace_title")
     terms = title_topic_signals(title)
     if not terms:

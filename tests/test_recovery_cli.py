@@ -437,7 +437,7 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 2)
         self.assertIn("no recoverable", recovered.stdout)
 
-    def test_codex_state_topic_match_beats_linkedin_content_poison(self) -> None:
+    def test_codex_state_topic_match_does_not_recover_without_exact_title(self) -> None:
         tree = json.loads(json.dumps(TREE))
         tree["windows"][0]["workspaces"][0]["title"] = "CX - Fargate Deploy Test"
         tree["windows"][0]["workspaces"][0]["index"] = 99
@@ -484,8 +484,9 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 0, recovered.stderr)
-        self.assertIn("codex-fargate-deploy", recovered.stdout)
+        self.assertEqual(recovered.returncode, 2, recovered.stderr)
+        self.assertIn("no recoverable", recovered.stdout)
+        self.assertNotIn("codex-fargate-deploy", recovered.stdout)
         self.assertNotIn("claude-linkedin-content-poison", recovered.stdout)
 
     def test_exact_posthog_title_beats_broad_topic_match(self) -> None:
