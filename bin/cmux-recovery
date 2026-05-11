@@ -130,7 +130,7 @@ def normalize_title(value: str | None) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-TITLE_PREFIX_TOKENS = {"cx", "sales", "marketing"}
+TITLE_PREFIX_TOKENS = {"cx"}
 
 
 def title_match_keys(value: str | None) -> set[str]:

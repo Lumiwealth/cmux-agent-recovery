@@ -609,6 +609,54 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertIn("claude --resume claude-paraxanthine-session", recovered.stdout)
 
+    def test_sales_and_marketing_prefixes_are_not_interchangeable(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "💰🚀 Sales - CX - Welcome Sequence"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        marketing = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "claude-marketing-welcome", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(marketing.returncode, 0, marketing.stderr)
+        sales = self.run_cli(
+            "record",
+            "--tool",
+            "claude",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "claude-sales-welcome", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(sales.returncode, 0, sales.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_title='💰🚀 Marketing - Welcome Sequence',
+                    normalized_title='marketing welcome sequence',
+                    last_seen='2026-05-11T00:00:00Z'
+                WHERE session_id='claude-marketing-welcome'
+                """
+            )
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_title='💰🚀 Sales - CX - Welcome Sequence',
+                    normalized_title='sales cx welcome sequence',
+                    last_seen='2026-05-10T00:00:00Z'
+                WHERE session_id='claude-sales-welcome'
+                """
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("claude-sales-welcome", recovered.stdout)
+        self.assertNotIn("claude-marketing-welcome", recovered.stdout)
+
     def test_current_screen_transcript_text_recovers_codex_without_resume_line(self) -> None:
         tree = json.loads(json.dumps(TREE))
         tree["windows"][0]["workspaces"][0]["title"] = "CX - OpenAI Credits"
