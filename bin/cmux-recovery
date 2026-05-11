@@ -1932,6 +1932,14 @@ def cmd_recover(args: argparse.Namespace) -> int:
         return 0
 
     cwd = str(candidate_cwd(selected))
+    topic = ""
+    if selected.get("topic_relevance") or selected.get("topic_penalty"):
+        topic = f" topic=+{int(selected.get('topic_relevance') or 0)}/-{int(selected.get('topic_penalty') or 0)}"
+    print(
+        f"cmr: selected {selected.get('tool')} session={selected.get('session_id')} "
+        f"score={selected.get('score')}{topic}"
+    )
+    sys.stdout.flush()
     os.chdir(cwd)
     if selected["tool"] == "codex":
         os.execvp("codex", ["codex", "-C", cwd, "resume", selected["session_id"]])
