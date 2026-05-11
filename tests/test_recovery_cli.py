@@ -724,6 +724,75 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("019e17db-f3aa-7cf2-972d-e0c52e1c9781", recovered.stdout)
         self.assertNotIn("claude-openai-credits-poison", recovered.stdout)
 
+    def test_cmr_candidate_list_text_is_not_used_as_screen_transcript_match(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "💰🚀 Sales - CX - Welcome Sequence"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+        self.env["CMUX_FAKE_SCREEN_TEXT"] = (
+            "cmr: multiple possible sessions found. Pick one with `cmr N`:\n"
+            "1. codex session=codex-current-cmr-thread score=200 title='cmr recovery bug' cwd=/Users/robertgrzesik\n"
+            "   first_user='I get so many errors when I start up Codex. Is this a problem? Can you fix this?'\n"
+        )
+
+        state = self.base / "codex-state.sqlite"
+        self.env["CMUX_CODEX_STATE"] = str(state)
+        unrelated_rollout = self.base / "rollout-cmr-current.jsonl"
+        unrelated_rollout.write_text(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "I get so many errors when I start up Codex. Is this a problem? Can you fix this?",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with sqlite3.connect(state) as con:
+            con.execute(
+                "CREATE TABLE threads (id TEXT, updated_at INTEGER, cwd TEXT, rollout_path TEXT, title TEXT, model TEXT, approval_mode TEXT, sandbox_policy TEXT, archived INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-current-cmr-thread",
+                    2000000000,
+                    str(self.base),
+                    str(unrelated_rollout),
+                    "cmr recovery bug",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+
+        intended = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "codex-sales-welcome", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(intended.returncode, 0, intended.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_title='💰🚀 Sales - CX - Welcome Sequence',
+                    normalized_title='sales cx welcome sequence'
+                WHERE session_id='codex-sales-welcome'
+                """
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex-sales-welcome", recovered.stdout)
+        self.assertNotIn("codex-current-cmr-thread", recovered.stdout)
+
     def test_codex_state_topic_match_does_not_recover_without_exact_title(self) -> None:
         tree = json.loads(json.dumps(TREE))
         tree["windows"][0]["workspaces"][0]["title"] = "CX - Fargate Deploy Test"

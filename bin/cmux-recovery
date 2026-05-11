@@ -1820,10 +1820,17 @@ def normalize_match_text(value: str) -> str:
 def screen_match_snippets(screen_text: str) -> list[str]:
     ignored = (
         "cmr:",
+        "first_user=",
         "last login:",
+        "multiple possible sessions found",
         "robertgrzesik@",
+        "pick one with",
         "press ctrl",
         "debug log",
+        "resume_cwd=",
+        "session=",
+        "title=",
+        "cwd=",
         "original token count",
         "wall time:",
         "process exited",
