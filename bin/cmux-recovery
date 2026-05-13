@@ -125,6 +125,7 @@ def normalize_title(value: str | None) -> str:
     text = (value or "").strip()
     text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
     text = text.lower()
+    text = re.sub(r"\blinked\s+in\b", "linkedin", text)
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"[^0-9a-z]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
