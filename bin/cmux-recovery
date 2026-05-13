@@ -2065,7 +2065,7 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
         return "selected", top
     second = candidates[1] if len(candidates) > 1 else None
     top_strong = strong_candidate_match(top)
-    second_title_match = bool(second and second.get("title_match"))
+    second_title_match = bool(second and viable_candidate(second) and second.get("title_match"))
     if top.get("title_match") and not top_strong and second_title_match:
         return "ambiguous", None
     if top["score"] >= 75 and (second is None or top["score"] - second["score"] >= 20):
