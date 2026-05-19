@@ -2218,11 +2218,16 @@ def trim_candidate_rows(
     chooser_args = argparse.Namespace(choice=None)
     candidates: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    seen_targets: set[tuple[str, str]] = set()
 
     for sample in samples:
         rss_kb = int(sample.get("total_rss_kb") or 0)
         if rss_kb < min_rss_kb:
             continue
+        target_key = (str(sample.get("workspace_ref") or sample.get("workspace_id") or ""), str(sample.get("surface_ref") or sample.get("surface_id") or ""))
+        if target_key in seen_targets:
+            continue
+        seen_targets.add(target_key)
         if not args.include_active and (sample.get("selected") or sample.get("active")):
             skipped.append({"workspace": sample, "reason": "active"})
             continue
@@ -3103,15 +3108,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     pressure = sub.add_parser("pressure")
     pressure.add_argument("--target-gb", type=float, default=24.0)
-    pressure.add_argument("--warn-workspace-gb", type=float, default=28.0)
-    pressure.add_argument("--critical-workspace-gb", type=float, default=36.0)
-    pressure.add_argument("--warn-ram-ratio", type=float, default=0.60)
-    pressure.add_argument("--critical-ram-ratio", type=float, default=0.75)
-    pressure.add_argument("--warn-swap-free-mb", type=float, default=4096.0)
-    pressure.add_argument("--critical-swap-free-mb", type=float, default=2048.0)
+    pressure.add_argument("--warn-workspace-gb", type=float, default=18.0)
+    pressure.add_argument("--critical-workspace-gb", type=float, default=30.0)
+    pressure.add_argument("--warn-ram-ratio", type=float, default=0.45)
+    pressure.add_argument("--critical-ram-ratio", type=float, default=0.65)
+    pressure.add_argument("--warn-swap-free-mb", type=float, default=8192.0)
+    pressure.add_argument("--critical-swap-free-mb", type=float, default=4096.0)
     pressure.add_argument("--warn-swap-used-pct", type=float, default=75.0)
-    pressure.add_argument("--warn-disk-free-gb", type=float, default=80.0)
-    pressure.add_argument("--critical-disk-free-gb", type=float, default=40.0)
+    pressure.add_argument("--warn-disk-free-gb", type=float, default=150.0)
+    pressure.add_argument("--critical-disk-free-gb", type=float, default=80.0)
     pressure.add_argument("--min-mb", type=float, default=128.0)
     pressure.add_argument("--min-age", default="30m")
     pressure.add_argument("--limit", type=int, default=6)
