@@ -143,7 +143,7 @@ Check total pressure before macOS gets into swap collapse:
 cmux-recovery pressure
 ```
 
-`pressure` combines CMUX workspace RSS, physical RAM, swap usage, and free disk space. It returns non-zero when pressure is warning or critical and includes the same dry-run trim plan as `trim`.
+`pressure` combines live CMUX agent memory, physical RAM, swap usage, and free disk space. It returns non-zero when pressure is warning or critical and includes the same dry-run trim plan as `trim`.
 
 Install a per-minute local LaunchAgent that sends a macOS notification on warning or critical pressure:
 
@@ -151,7 +151,7 @@ Install a per-minute local LaunchAgent that sends a macOS notification on warnin
 bin/install-pressure-monitor
 ```
 
-Notifications are throttled to once every 15 minutes while the pressure level stays the same. Warning starts at about 30 GB sampled workspace RSS, 60% of physical RAM, less than 8 GB swap free, or less than 100 GB disk free. Critical starts at about 40 GB sampled workspace RSS, 80% of physical RAM, less than 2 GB swap free, or less than 40 GB disk free. Warning and critical alerts use a visible dialog with the current memory, swap, disk, and suggested safe-trim details; the dialog auto-dismisses after 45 seconds.
+Notifications are throttled to once every 20 minutes while the pressure level stays the same. Warning starts at about 40 GB of live CMUX agent memory. Critical starts at about 50 GB. The alert treats about 60 GB as the crash danger zone and shows the current agent memory, approximate headroom, swap cushion, disk free, and live recoverable agents that could be stopped and resumed later.
 
 Remove it:
 
@@ -188,7 +188,7 @@ The database stores:
 - transcript or rollout path
 - tool, model, permission/sandbox mode where available
 - first seen, last seen, and restore attempts
-- per-workspace telemetry samples: total RSS, `%MEM`, `%CPU`, process count, and top process names
+- per-workspace telemetry samples: approximate live agent memory, `%MEM`, `%CPU`, process count, and top process names
 
 Treat the database as private local state. Session IDs, transcript paths, and workspace titles can reveal sensitive project context.
 

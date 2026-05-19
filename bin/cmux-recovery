@@ -764,7 +764,7 @@ def record_memory_snapshot(
         top = [
             {
                 "pid": row.get("pid"),
-                "name": row.get("command_name"),
+                "name": row.get("command_name") or row.get("name"),
                 "rss_kb": row.get("rss_kb"),
                 "pmem": row.get("pmem"),
                 "pcpu": row.get("pcpu"),
@@ -2240,6 +2240,9 @@ def trim_candidate_rows(
         if status != "selected" or selected is None:
             skipped.append({"workspace": sample, "reason": status, "candidates": session_candidates[:5]})
             continue
+        if not sample_has_agent_process(sample, selected.get("tool")):
+            skipped.append({"workspace": sample, "reason": "no-live-agent-process", "selected": selected})
+            continue
 
         age_seconds = max(0.0, now - parse_time(selected.get("last_seen")))
         if age_seconds < min_age_seconds:
@@ -2257,6 +2260,23 @@ def trim_candidate_rows(
 
     candidates.sort(key=lambda item: (int(item["rss_kb"]), float(item["age_seconds"])), reverse=True)
     return total_rss_kb, target_rss_kb, candidates, skipped
+
+
+def sample_has_agent_process(sample: dict[str, Any], tool: str | None) -> bool:
+    if tool not in {"codex", "claude"}:
+        return True
+    raw_processes = sample.get("top_processes")
+    if isinstance(raw_processes, list):
+        processes = raw_processes
+    else:
+        try:
+            processes = json.loads(sample.get("top_processes_json") or "[]")
+        except json.JSONDecodeError:
+            processes = []
+    names = {str(row.get("name") or "").lower() for row in processes if isinstance(row, dict)}
+    if tool == "codex":
+        return "codex" in names
+    return "claude" in names or any("claude" in name for name in names)
 
 
 def plan_trim(args: argparse.Namespace, total_rss_kb: int, target_rss_kb: int, candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
@@ -2501,7 +2521,6 @@ def pressure_status(
     args: argparse.Namespace,
 ) -> tuple[str, list[str]]:
     reasons: list[str] = []
-    status = "ok"
     workspace_gb = workspace_rss_kb / 1024 / 1024
     system_gb = system_bytes / 1024 / 1024 / 1024 if system_bytes else 0.0
     swap_total = swap.get("total") or 0.0
@@ -2509,32 +2528,26 @@ def pressure_status(
     swap_free = swap.get("free") or 0.0
     swap_used_pct = (swap_used / swap_total * 100.0) if swap_total else 0.0
 
-    def raise_to(next_status: str, reason: str) -> None:
-        nonlocal status
-        order = {"ok": 0, "warning": 1, "critical": 2}
-        if order[next_status] > order[status]:
-            status = next_status
-        reasons.append(reason)
-
+    status = "ok"
     if workspace_gb >= args.critical_workspace_gb:
-        raise_to("critical", f"workspace process RSS is {workspace_gb:.1f} GB")
+        status = "critical"
+        reasons.append(f"CMUX agents are using about {workspace_gb:.1f} GB")
     elif workspace_gb >= args.warn_workspace_gb:
-        raise_to("warning", f"workspace process RSS is {workspace_gb:.1f} GB")
+        status = "warning"
+        reasons.append(f"CMUX agents are using about {workspace_gb:.1f} GB")
 
     if system_gb and workspace_gb >= system_gb * args.critical_ram_ratio:
-        raise_to("critical", f"workspace RSS is {workspace_gb:.1f} GB vs {system_gb:.1f} GB physical RAM")
-    elif system_gb and workspace_gb >= system_gb * args.warn_ram_ratio:
-        raise_to("warning", f"workspace RSS is {workspace_gb:.1f} GB vs {system_gb:.1f} GB physical RAM")
+        status = "critical"
+        reasons.append(f"agent memory is high for {system_gb:.1f} GB physical RAM")
+    elif system_gb and workspace_gb >= system_gb * args.warn_ram_ratio and status == "ok":
+        status = "warning"
+        reasons.append(f"agent memory is getting high for {system_gb:.1f} GB physical RAM")
 
-    if swap_total and swap_free <= args.critical_swap_free_mb:
-        raise_to("critical", f"swap free is {swap_free:.0f} MB")
-    elif swap_total and (swap_free <= args.warn_swap_free_mb or swap_used_pct >= args.warn_swap_used_pct):
-        raise_to("warning", f"swap is {swap_used_pct:.0f}% used, {swap_free:.0f} MB free")
+    if swap_total and (swap_free <= args.warn_swap_free_mb or swap_used_pct >= args.warn_swap_used_pct):
+        reasons.append(f"swap cushion is low: {swap_free:.0f} MB free")
 
-    if free_disk_gb and free_disk_gb <= args.critical_disk_free_gb:
-        raise_to("critical", f"disk free is {free_disk_gb:.1f} GB")
-    elif free_disk_gb and free_disk_gb <= args.warn_disk_free_gb:
-        raise_to("warning", f"disk free is {free_disk_gb:.1f} GB")
+    if free_disk_gb and free_disk_gb <= args.warn_disk_free_gb:
+        reasons.append(f"disk free space is low: {free_disk_gb:.1f} GB")
 
     return status, reasons
 
@@ -2575,15 +2588,19 @@ def pressure_alert_message(
 ) -> str:
     workspace_gb = total_rss_kb / 1024 / 1024
     ram_gb = system_bytes / 1024 / 1024 / 1024 if system_bytes else 0.0
+    danger_gb = 60.0
+    headroom_gb = max(0.0, danger_gb - workspace_gb)
     lines = [
         f"Status: {status.upper()}",
-        f"CMUX workspace RSS: {workspace_gb:.1f} GB",
+        f"CMUX agent memory: {workspace_gb:.1f} GB",
+        f"Crash danger zone: about {danger_gb:.0f} GB",
+        f"Headroom before danger zone: about {headroom_gb:.1f} GB",
     ]
     if ram_gb:
         lines.append(f"Physical RAM: {ram_gb:.1f} GB")
     lines.extend(
         [
-            f"Swap: {swap.get('used', 0):.0f} MB used / {swap.get('total', 0):.0f} MB total, {swap.get('free', 0):.0f} MB free",
+            f"Swap cushion: {swap.get('free', 0):.0f} MB free ({swap.get('used', 0):.0f} MB used / {swap.get('total', 0):.0f} MB total)",
             f"Disk free: {free_disk_gb:.1f} GB",
         ]
     )
@@ -2593,7 +2610,7 @@ def pressure_alert_message(
         lines.extend(f"- {reason}" for reason in reasons[:4])
     if planned:
         lines.append("")
-        lines.append(f"Suggested safe trim: {len(planned)} recoverable agents")
+        lines.append(f"Possible cleanup: {len(planned)} live recoverable agents")
         for item in planned[:3]:
             workspace = item.get("workspace") or {}
             title = workspace.get("workspace_title") or "(no title)"
@@ -2728,8 +2745,10 @@ def cmd_pressure(args: argparse.Namespace) -> int:
     if not args.quiet:
         ram = f"{system_bytes / 1024 / 1024 / 1024:.1f} GB" if system_bytes else "unknown"
         print(
-            f"pressure: status={status} workspace_rss={format_mb(total_rss_kb)} "
-            f"physical_ram={ram} swap_used={swap.get('used', 0):.0f}MB/{swap.get('total', 0):.0f}MB "
+            f"pressure: status={status} agent_memory={format_mb(total_rss_kb)} "
+            f"physical_ram={ram} danger_zone=60.0GB "
+            f"headroom={max(0.0, 60.0 - (total_rss_kb / 1024 / 1024)):.1f}GB "
+            f"swap_used={swap.get('used', 0):.0f}MB/{swap.get('total', 0):.0f}MB "
             f"swap_free={swap.get('free', 0):.0f}MB disk_free={free_disk_gb:.1f}GB"
         )
         for reason in reasons:
@@ -3172,10 +3191,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     pressure = sub.add_parser("pressure")
     pressure.add_argument("--target-gb", type=float, default=24.0)
-    pressure.add_argument("--warn-workspace-gb", type=float, default=30.0)
-    pressure.add_argument("--critical-workspace-gb", type=float, default=40.0)
-    pressure.add_argument("--warn-ram-ratio", type=float, default=0.60)
-    pressure.add_argument("--critical-ram-ratio", type=float, default=0.80)
+    pressure.add_argument("--warn-workspace-gb", type=float, default=40.0)
+    pressure.add_argument("--critical-workspace-gb", type=float, default=50.0)
+    pressure.add_argument("--warn-ram-ratio", type=float, default=0.80)
+    pressure.add_argument("--critical-ram-ratio", type=float, default=1.00)
     pressure.add_argument("--warn-swap-free-mb", type=float, default=8192.0)
     pressure.add_argument("--critical-swap-free-mb", type=float, default=2048.0)
     pressure.add_argument("--warn-swap-used-pct", type=float, default=75.0)
@@ -3187,7 +3206,7 @@ def build_parser() -> argparse.ArgumentParser:
     pressure.add_argument("--include-active", action="store_true")
     pressure.add_argument("--no-snapshot", action="store_true")
     pressure.add_argument("--notify", action="store_true")
-    pressure.add_argument("--notify-cooldown", type=float, default=15 * 60)
+    pressure.add_argument("--notify-cooldown", type=float, default=20 * 60)
     pressure.add_argument("--quiet", action="store_true")
     pressure.add_argument("--json", action="store_true")
     pressure.add_argument("--source", default="pressure")
