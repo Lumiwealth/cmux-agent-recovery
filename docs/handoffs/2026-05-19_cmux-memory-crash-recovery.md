@@ -21,6 +21,9 @@ Important tab pins already written to the local recovery DB:
 - Poisoned exact-title matches from generic LinkedIn workflow transcripts are suppressed instead of offered as choices.
 - Generic restored tabs named `Development` now include recent untitled Codex state rows from `~/.codex/state_5.sqlite` as `recent-cwd` candidates.
 - The newest recent-cwd candidate can auto-select when it is less than two hours old and at least ten minutes newer than the next recent-cwd candidate.
+- Specific restored tabs can now recover recent untitled Codex state rows when the same cwd and Codex thread title/payload strongly match the workspace title. This fixes `(CX) Client - Peter H`, where Codex state had `Peter H` in the thread title but the recovery binding had no workspace title.
+- Codex hooks were installed in `/Users/robertgrzesik/.codex/hooks.json` but disabled by `/Users/robertgrzesik/.codex/config.toml` (`[features] hooks = false`). The local config has been changed to `hooks = true` so new Codex sessions should record `SessionStart`, `UserPromptSubmit`, and `Stop` bindings again.
+- A local recovery pin was written for `(CX) 💰🚀 Client - Peter H` -> Codex `019e4113-4909-7991-8909-b85a9a2593e5`.
 
 Commits:
 
@@ -28,6 +31,7 @@ Commits:
 - `bd6d314 Suppress generic workflow cmr matches`
 - `c620936 Handle unnamed Development Codex recovery` - pushed to `origin/main`
 - `f72d7a5 Auto-select clear newest Development recovery` - local only as of this handoff
+- Pending after this handoff update: specific untitled Codex topic fallback for Peter H.
 
 ## Current memory pressure
 
@@ -86,8 +90,9 @@ Recommended next feature to upstream or build locally:
 
 ## Immediate next steps
 
-1. Push `f72d7a5` to `origin/main` if Rob wants the newest auto-select fix on GitHub.
+1. Push the local `main` commits to `origin/main` when Rob wants these recovery fixes on GitHub.
 2. Run `cmr --dry-run` in the unnamed `Development` tab and confirm it prints the direct resume command for `019e4163-62d1-7a31-8a67-90978ec13351`.
-3. Use `cmux-recovery trim` as the non-destructive way to plan memory relief.
-4. Ask Rob before any `trim --execute`, because stopping active agents is externally visible and may interrupt work.
-5. Open or update upstream CMUX GitHub issues with this concrete repro: restored generic `Development` tab, many agent sessions, memory-pressure crash, stale workspace titles, and need for native agent manifests.
+3. Run `cmr --dry-run` in `(CX) 💰🚀 Client - Peter H`; it should recover Codex `019e4113-4909-7991-8909-b85a9a2593e5`.
+4. Use `cmux-recovery trim` as the non-destructive way to plan memory relief.
+5. Ask Rob before any `trim --execute`, because stopping active agents is externally visible and may interrupt work.
+6. Open or update upstream CMUX GitHub issues with this concrete repro: restored generic `Development` tab, many agent sessions, memory-pressure crash, stale workspace titles, and need for native agent manifests.

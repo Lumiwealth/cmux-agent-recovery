@@ -519,6 +519,72 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("codex-clear-newest", recovered.stdout)
         self.assertNotIn("multiple possible sessions", recovered.stdout)
 
+    def test_specific_workspace_recovers_recent_untitled_codex_state_by_topic(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "(CX) Client - Peter H"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        state = self.base / "codex-state.sqlite"
+        self.env["CMUX_CODEX_STATE"] = str(state)
+        rollout = self.base / "rollout-peter-h.jsonl"
+        rollout.write_text(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "Peter H got back from Upwork. Research his trading strategy and the bugs we were fixing.",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        unrelated_rollout = self.base / "rollout-other-client.jsonl"
+        unrelated_rollout.write_text(
+            json.dumps({"type": "user", "message": {"content": "Review another client strategy."}}) + "\n",
+            encoding="utf-8",
+        )
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        with sqlite3.connect(state) as con:
+            con.execute(
+                "CREATE TABLE threads (id TEXT, updated_at INTEGER, cwd TEXT, rollout_path TEXT, title TEXT, model TEXT, approval_mode TEXT, sandbox_policy TEXT, archived INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-peter-h",
+                    now - 90,
+                    str(self.restore_cwd),
+                    str(rollout),
+                    "So one of our clients, Peter H, finally got back to us about the Upwork strategy",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-other-client",
+                    now - 30,
+                    str(self.restore_cwd),
+                    str(unrelated_rollout),
+                    "Review another client strategy",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex -C", recovered.stdout)
+        self.assertIn("codex-peter-h", recovered.stdout)
+        self.assertNotIn("codex-other-client", recovered.stdout)
+
     def test_old_matching_title_is_not_lost_behind_recent_global_limit(self) -> None:
         old = self.run_cli(
             "record",
@@ -980,7 +1046,7 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("codex-sales-welcome", recovered.stdout)
         self.assertNotIn("codex-current-cmr-thread", recovered.stdout)
 
-    def test_codex_state_topic_match_does_not_recover_without_exact_title(self) -> None:
+    def test_codex_state_weak_topic_match_does_not_recover_without_exact_title(self) -> None:
         tree = json.loads(json.dumps(TREE))
         tree["windows"][0]["workspaces"][0]["title"] = "CX - Fargate Deploy Test"
         tree["windows"][0]["workspaces"][0]["index"] = 99
@@ -1004,7 +1070,7 @@ class RecoveryCliTests(unittest.TestCase):
                     2000000000,
                     str(self.restore_cwd),
                     str(rollout),
-                    "Plan the Fargate deployment runner",
+                    "Plan deployment runner",
                     "gpt",
                     "never",
                     "workspace-write",
