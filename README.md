@@ -151,7 +151,7 @@ Install a per-minute local LaunchAgent that sends a macOS notification on warnin
 bin/install-pressure-monitor
 ```
 
-Notifications are throttled to once every 15 minutes while the pressure level stays the same. Defaults are intentionally early: warning starts at about 18 GB sampled workspace RSS, 45% of physical RAM, less than 8 GB swap free, or less than 150 GB disk free. Critical starts at about 30 GB sampled workspace RSS, 65% of physical RAM, less than 4 GB swap free, or less than 80 GB disk free.
+Notifications are throttled to once every 15 minutes while the pressure level stays the same. Warning starts at about 30 GB sampled workspace RSS, 60% of physical RAM, less than 8 GB swap free, or less than 100 GB disk free. Critical starts at about 40 GB sampled workspace RSS, 80% of physical RAM, less than 2 GB swap free, or less than 40 GB disk free. Warning and critical alerts use a visible dialog with the current memory, swap, disk, and suggested safe-trim details; the dialog auto-dismisses after 45 seconds.
 
 Remove it:
 

@@ -2563,25 +2563,80 @@ def record_notification(status: str) -> None:
     path.write_text(json.dumps({"status": status, "notified_at": time.time()}, separators=(",", ":")), encoding="utf-8")
 
 
-def notify_pressure(status: str, reasons: list[str], planned: list[dict[str, Any]], cooldown_seconds: float) -> None:
+def pressure_alert_message(
+    *,
+    status: str,
+    reasons: list[str],
+    planned: list[dict[str, Any]],
+    total_rss_kb: int,
+    system_bytes: int,
+    swap: dict[str, float],
+    free_disk_gb: float,
+) -> str:
+    workspace_gb = total_rss_kb / 1024 / 1024
+    ram_gb = system_bytes / 1024 / 1024 / 1024 if system_bytes else 0.0
+    lines = [
+        f"Status: {status.upper()}",
+        f"CMUX workspace RSS: {workspace_gb:.1f} GB",
+    ]
+    if ram_gb:
+        lines.append(f"Physical RAM: {ram_gb:.1f} GB")
+    lines.extend(
+        [
+            f"Swap: {swap.get('used', 0):.0f} MB used / {swap.get('total', 0):.0f} MB total, {swap.get('free', 0):.0f} MB free",
+            f"Disk free: {free_disk_gb:.1f} GB",
+        ]
+    )
+    if reasons:
+        lines.append("")
+        lines.append("Why:")
+        lines.extend(f"- {reason}" for reason in reasons[:4])
+    if planned:
+        lines.append("")
+        lines.append(f"Suggested safe trim: {len(planned)} recoverable agents")
+        for item in planned[:3]:
+            workspace = item.get("workspace") or {}
+            title = workspace.get("workspace_title") or "(no title)"
+            lines.append(f"- {format_mb(item.get('rss_kb'))}: {title}")
+    return "\n".join(lines)
+
+
+def notify_pressure(
+    status: str,
+    reasons: list[str],
+    planned: list[dict[str, Any]],
+    cooldown_seconds: float,
+    *,
+    total_rss_kb: int,
+    system_bytes: int,
+    swap: dict[str, float],
+    free_disk_gb: float,
+) -> None:
     if status == "ok":
         return
     if not notification_allowed(status, cooldown_seconds):
         return
-    top_reason = reasons[0] if reasons else "CMUX memory pressure is high"
-    trim_hint = ""
-    if planned:
-        trim_hint = f" Suggested trim: {len(planned)} recoverable agents."
-    message = f"{top_reason}.{trim_hint}"
+    message = pressure_alert_message(
+        status=status,
+        reasons=reasons,
+        planned=planned,
+        total_rss_kb=total_rss_kb,
+        system_bytes=system_bytes,
+        swap=swap,
+        free_disk_gb=free_disk_gb,
+    )
     title = "CMUX memory pressure"
     try:
         subprocess.run(
             [
                 "osascript",
                 "-e",
-                f'display notification {json.dumps(message)} with title {json.dumps(title)} subtitle {json.dumps(status.upper())}',
+                (
+                    f'display dialog {json.dumps(message)} with title {json.dumps(title)} '
+                    f'buttons {{"OK"}} default button "OK" giving up after 45'
+                ),
             ],
-            timeout=3.0,
+            timeout=50.0,
             check=False,
             capture_output=True,
             text=True,
@@ -2641,7 +2696,16 @@ def cmd_pressure(args: argparse.Namespace) -> int:
         args=args,
     )
     if args.notify:
-        notify_pressure(status, reasons, planned, args.notify_cooldown)
+        notify_pressure(
+            status,
+            reasons,
+            planned,
+            args.notify_cooldown,
+            total_rss_kb=total_rss_kb,
+            system_bytes=system_bytes,
+            swap=swap,
+            free_disk_gb=free_disk_gb,
+        )
     if args.json:
         print(
             json.dumps(
@@ -3108,15 +3172,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     pressure = sub.add_parser("pressure")
     pressure.add_argument("--target-gb", type=float, default=24.0)
-    pressure.add_argument("--warn-workspace-gb", type=float, default=18.0)
-    pressure.add_argument("--critical-workspace-gb", type=float, default=30.0)
-    pressure.add_argument("--warn-ram-ratio", type=float, default=0.45)
-    pressure.add_argument("--critical-ram-ratio", type=float, default=0.65)
+    pressure.add_argument("--warn-workspace-gb", type=float, default=30.0)
+    pressure.add_argument("--critical-workspace-gb", type=float, default=40.0)
+    pressure.add_argument("--warn-ram-ratio", type=float, default=0.60)
+    pressure.add_argument("--critical-ram-ratio", type=float, default=0.80)
     pressure.add_argument("--warn-swap-free-mb", type=float, default=8192.0)
-    pressure.add_argument("--critical-swap-free-mb", type=float, default=4096.0)
+    pressure.add_argument("--critical-swap-free-mb", type=float, default=2048.0)
     pressure.add_argument("--warn-swap-used-pct", type=float, default=75.0)
-    pressure.add_argument("--warn-disk-free-gb", type=float, default=150.0)
-    pressure.add_argument("--critical-disk-free-gb", type=float, default=80.0)
+    pressure.add_argument("--warn-disk-free-gb", type=float, default=100.0)
+    pressure.add_argument("--critical-disk-free-gb", type=float, default=40.0)
     pressure.add_argument("--min-mb", type=float, default=128.0)
     pressure.add_argument("--min-age", default="30m")
     pressure.add_argument("--limit", type=int, default=6)
