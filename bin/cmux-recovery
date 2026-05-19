@@ -107,6 +107,8 @@ SCREEN_RESUME_RE = re.compile(
 )
 SCREEN_SCROLLBACK_LINES = 2400
 SCREEN_TRANSCRIPT_SCAN_LIMIT = 300
+GENERIC_FALLBACK_AUTO_SELECT_GAP_SECONDS = 10 * 60
+GENERIC_FALLBACK_AUTO_SELECT_MAX_AGE_SECONDS = 2 * 60 * 60
 
 
 def utc_now() -> str:
@@ -2106,6 +2108,23 @@ def viable_candidate(item: dict[str, Any]) -> bool:
     return int(item.get("score") or 0) >= 75
 
 
+def recent_cwd_fallback_can_auto_select(top: dict[str, Any], second: dict[str, Any] | None) -> bool:
+    if not top.get("generic_workspace_fallback_match"):
+        return False
+    top_seen = parse_time(top.get("last_seen"))
+    if top_seen <= 0:
+        return False
+    age = max(0.0, time.time() - top_seen)
+    if age > GENERIC_FALLBACK_AUTO_SELECT_MAX_AGE_SECONDS:
+        return False
+    if second is None:
+        return True
+    if not second.get("generic_workspace_fallback_match") or not viable_candidate(second):
+        return True
+    second_seen = parse_time(second.get("last_seen"))
+    return top_seen - second_seen >= GENERIC_FALLBACK_AUTO_SELECT_GAP_SECONDS
+
+
 def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
     if args.choice is not None:
         index = args.choice - 1
@@ -2123,9 +2142,11 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
         return "selected", top
     if top.get("current_screen_transcript_match"):
         return "selected", top
-    if top.get("generic_workspace_fallback_match"):
-        return "ambiguous", None
     second = candidates[1] if len(candidates) > 1 else None
+    if top.get("generic_workspace_fallback_match"):
+        if recent_cwd_fallback_can_auto_select(top, second):
+            return "selected", top
+        return "ambiguous", None
     top_strong = strong_candidate_match(top)
     second_title_match = bool(second and viable_candidate(second) and second.get("title_match"))
     if top.get("title_match") and not top_strong and second_title_match:

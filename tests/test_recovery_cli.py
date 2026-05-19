@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import sqlite3
@@ -460,6 +461,63 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("codex recent-cwd session=codex-cmr-memory-fix", recovered.stdout)
         self.assertIn("Fix the cmr command and cmux memory crash recovery", recovered.stdout)
         self.assertIn("codex-other-recent", recovered.stdout)
+
+    def test_generic_development_tab_auto_selects_clear_newest_untitled_codex_state(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "Development"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        state = self.base / "codex-state.sqlite"
+        self.env["CMUX_CODEX_STATE"] = str(state)
+        rollout = self.base / "rollout-clear-newest.jsonl"
+        rollout.write_text(
+            json.dumps({"type": "user", "message": {"content": "Fix cmr recent Development tab recovery."}}) + "\n",
+            encoding="utf-8",
+        )
+        older_rollout = self.base / "rollout-older.jsonl"
+        older_rollout.write_text(
+            json.dumps({"type": "user", "message": {"content": "Review unrelated client work."}}) + "\n",
+            encoding="utf-8",
+        )
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        with sqlite3.connect(state) as con:
+            con.execute(
+                "CREATE TABLE threads (id TEXT, updated_at INTEGER, cwd TEXT, rollout_path TEXT, title TEXT, model TEXT, approval_mode TEXT, sandbox_policy TEXT, archived INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-clear-newest",
+                    now - 60,
+                    str(self.restore_cwd),
+                    str(rollout),
+                    "Fix cmr recent Development tab recovery",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-older-untitled",
+                    now - 25 * 60,
+                    str(self.restore_cwd),
+                    str(older_rollout),
+                    "Review unrelated client work",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex -C", recovered.stdout)
+        self.assertIn("codex-clear-newest", recovered.stdout)
+        self.assertNotIn("multiple possible sessions", recovered.stdout)
 
     def test_old_matching_title_is_not_lost_behind_recent_global_limit(self) -> None:
         old = self.run_cli(
