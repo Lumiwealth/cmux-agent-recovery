@@ -137,6 +137,28 @@ cmux-recovery trim --execute
 
 After a tab is stopped, run `cmr` inside that tab to resume it.
 
+Check total pressure before macOS gets into swap collapse:
+
+```sh
+cmux-recovery pressure
+```
+
+`pressure` combines CMUX workspace RSS, physical RAM, swap usage, and free disk space. It returns non-zero when pressure is warning or critical and includes the same dry-run trim plan as `trim`.
+
+Install a per-minute local LaunchAgent that sends a macOS notification on warning or critical pressure:
+
+```sh
+bin/install-pressure-monitor
+```
+
+Notifications are throttled to once every 15 minutes while the pressure level stays the same.
+
+Remove it:
+
+```sh
+bin/uninstall-pressure-monitor
+```
+
 Import old recovery reports and local agent state:
 
 ```sh
@@ -199,3 +221,5 @@ CMUX currently restores layout and metadata after relaunch, but it does not rest
 - [Stable agent session recovery after CMUX crash or relaunch](https://github.com/manaflow-ai/cmux/issues/3342)
 - [Persist session manifest and re-attach live agent processes after daemon/app restart](https://github.com/manaflow-ai/cmux/issues/3322)
 - [Show per-workspace/session memory and CPU usage in sidebar](https://github.com/manaflow-ai/cmux/issues/3130)
+- [Native memory telemetry CLI and trim recoverable agent command](https://github.com/manaflow-ai/cmux/issues/4059)
+- [Fix 80GB memory growth from retained WebKit and cmux monitor helpers](https://github.com/manaflow-ai/cmux/issues/4188)

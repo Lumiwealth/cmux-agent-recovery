@@ -1425,6 +1425,25 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("5.9 MB", listed.stdout)
         self.assertIn("cpu=4.0%", listed.stdout)
 
+    def test_pressure_reports_critical_swap_and_workspace_memory(self) -> None:
+        self.env.pop("CMUX_RECOVERY_DISABLE_MEMORY", None)
+        self.env["CMUX_RECOVERY_SYSTEM_MEMORY_BYTES"] = str(48 * 1024 * 1024 * 1024)
+        self.env["CMUX_RECOVERY_SWAPUSAGE"] = "vm.swapusage: total = 14336.00M  used = 12837.25M  free = 1498.75M  (encrypted)"
+        self.env["CMUX_RECOVERY_DISK_FREE_BYTES"] = str(51 * 1024 * 1024 * 1024)
+        self.env["CMUX_RECOVERY_PS_JSON"] = json.dumps(
+            [
+                {"pid": 10, "ppid": 1, "pgid": 10, "tty": "ttys999", "rss_kb": 1000, "pmem": 0.1, "command_name": "zsh"},
+                {"pid": 11, "ppid": 10, "pgid": 10, "tty": "ttys999", "rss_kb": 38 * 1024 * 1024, "pmem": 79.0, "pcpu": 1.5, "command_name": "codex"},
+            ]
+        )
+
+        pressure = self.run_cli("pressure", "--json")
+        self.assertEqual(pressure.returncode, 1, pressure.stderr)
+        payload = json.loads(pressure.stdout)
+        self.assertEqual(payload["status"], "critical")
+        self.assertIn("swap free is 1499 MB", payload["reasons"])
+        self.assertGreater(payload["workspace_rss_mb"], 38000)
+
     def test_sidebar_metrics_updates_workspace_descriptions_when_executed(self) -> None:
         self.env.pop("CMUX_RECOVERY_DISABLE_MEMORY", None)
         tree = json.loads(json.dumps(TREE))

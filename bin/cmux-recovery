@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -2433,6 +2434,249 @@ def cmd_trim(args: argparse.Namespace) -> int:
     return 0
 
 
+def system_memory_bytes() -> int:
+    override = os.environ.get("CMUX_RECOVERY_SYSTEM_MEMORY_BYTES")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            return 0
+    try:
+        proc = subprocess.run(["sysctl", "-n", "hw.memsize"], text=True, capture_output=True, timeout=2.0, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    if proc.returncode != 0:
+        return 0
+    try:
+        return int(proc.stdout.strip())
+    except ValueError:
+        return 0
+
+
+def swap_usage_mb() -> dict[str, float]:
+    override = os.environ.get("CMUX_RECOVERY_SWAPUSAGE")
+    if override:
+        raw = override
+    else:
+        try:
+            proc = subprocess.run(["sysctl", "vm.swapusage"], text=True, capture_output=True, timeout=2.0, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return {"total": 0.0, "used": 0.0, "free": 0.0}
+        if proc.returncode != 0:
+            return {"total": 0.0, "used": 0.0, "free": 0.0}
+        raw = proc.stdout
+    out = {"total": 0.0, "used": 0.0, "free": 0.0}
+    for key in out:
+        match = re.search(rf"\b{key}\s*=\s*(\d+(?:\.\d+)?)M", raw)
+        if match:
+            out[key] = float(match.group(1))
+    return out
+
+
+def disk_free_gb(path: str | Path = "/System/Volumes/Data") -> float:
+    override = os.environ.get("CMUX_RECOVERY_DISK_FREE_BYTES")
+    if override:
+        try:
+            return int(override) / 1024 / 1024 / 1024
+        except ValueError:
+            return 0.0
+    try:
+        usage = shutil.disk_usage(str(path))
+    except OSError:
+        return 0.0
+    return usage.free / 1024 / 1024 / 1024
+
+
+def pressure_status(
+    *,
+    workspace_rss_kb: int,
+    system_bytes: int,
+    swap: dict[str, float],
+    free_disk_gb: float,
+    args: argparse.Namespace,
+) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    status = "ok"
+    workspace_gb = workspace_rss_kb / 1024 / 1024
+    system_gb = system_bytes / 1024 / 1024 / 1024 if system_bytes else 0.0
+    swap_total = swap.get("total") or 0.0
+    swap_used = swap.get("used") or 0.0
+    swap_free = swap.get("free") or 0.0
+    swap_used_pct = (swap_used / swap_total * 100.0) if swap_total else 0.0
+
+    def raise_to(next_status: str, reason: str) -> None:
+        nonlocal status
+        order = {"ok": 0, "warning": 1, "critical": 2}
+        if order[next_status] > order[status]:
+            status = next_status
+        reasons.append(reason)
+
+    if workspace_gb >= args.critical_workspace_gb:
+        raise_to("critical", f"workspace process RSS is {workspace_gb:.1f} GB")
+    elif workspace_gb >= args.warn_workspace_gb:
+        raise_to("warning", f"workspace process RSS is {workspace_gb:.1f} GB")
+
+    if system_gb and workspace_gb >= system_gb * args.critical_ram_ratio:
+        raise_to("critical", f"workspace RSS is {workspace_gb:.1f} GB vs {system_gb:.1f} GB physical RAM")
+    elif system_gb and workspace_gb >= system_gb * args.warn_ram_ratio:
+        raise_to("warning", f"workspace RSS is {workspace_gb:.1f} GB vs {system_gb:.1f} GB physical RAM")
+
+    if swap_total and swap_free <= args.critical_swap_free_mb:
+        raise_to("critical", f"swap free is {swap_free:.0f} MB")
+    elif swap_total and (swap_free <= args.warn_swap_free_mb or swap_used_pct >= args.warn_swap_used_pct):
+        raise_to("warning", f"swap is {swap_used_pct:.0f}% used, {swap_free:.0f} MB free")
+
+    if free_disk_gb and free_disk_gb <= args.critical_disk_free_gb:
+        raise_to("critical", f"disk free is {free_disk_gb:.1f} GB")
+    elif free_disk_gb and free_disk_gb <= args.warn_disk_free_gb:
+        raise_to("warning", f"disk free is {free_disk_gb:.1f} GB")
+
+    return status, reasons
+
+
+def pressure_notify_state_path() -> Path:
+    return Path(os.environ.get("CMUX_RECOVERY_NOTIFY_STATE", str(db_path().parent / "pressure-notify.json"))).expanduser()
+
+
+def notification_allowed(status: str, cooldown_seconds: float) -> bool:
+    if status == "ok":
+        return False
+    path = pressure_notify_state_path()
+    now = time.time()
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        previous = {}
+    previous_status = previous.get("status")
+    previous_at = float(previous.get("notified_at") or 0.0)
+    return previous_status != status or now - previous_at >= cooldown_seconds
+
+
+def record_notification(status: str) -> None:
+    path = pressure_notify_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"status": status, "notified_at": time.time()}, separators=(",", ":")), encoding="utf-8")
+
+
+def notify_pressure(status: str, reasons: list[str], planned: list[dict[str, Any]], cooldown_seconds: float) -> None:
+    if status == "ok":
+        return
+    if not notification_allowed(status, cooldown_seconds):
+        return
+    top_reason = reasons[0] if reasons else "CMUX memory pressure is high"
+    trim_hint = ""
+    if planned:
+        trim_hint = f" Suggested trim: {len(planned)} recoverable agents."
+    message = f"{top_reason}.{trim_hint}"
+    title = "CMUX memory pressure"
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification {json.dumps(message)} with title {json.dumps(title)} subtitle {json.dumps(status.upper())}',
+            ],
+            timeout=3.0,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    record_notification(status)
+
+
+def cmd_pressure(args: argparse.Namespace) -> int:
+    trim_args = argparse.Namespace(
+        target_gb=args.target_gb,
+        min_mb=args.min_mb,
+        min_age=args.min_age,
+        limit=args.limit,
+        method="respawn",
+        execute=False,
+        force=False,
+        include_active=args.include_active,
+        no_snapshot=args.no_snapshot,
+        source=args.source,
+    )
+    with connect_db() as con:
+        refresh_codex_state(con)
+        if args.no_snapshot:
+            samples = latest_memory_samples(con)
+        else:
+            rows = tree_workspaces()
+            insert_workspace_observations(con, args.source, rows)
+            samples = record_memory_snapshot(con, args.source, rows, force=True)
+        total_rss_kb, target_rss_kb, candidates, skipped = trim_candidate_rows(con, samples, trim_args)
+        planned, projected_rss_kb = plan_trim(trim_args, total_rss_kb, target_rss_kb, candidates)
+        log_trim(
+            con,
+            action="pressure-check",
+            status="dry-run",
+            method="respawn",
+            total_rss_kb=total_rss_kb,
+            target_rss_kb=target_rss_kb,
+            projected_rss_kb=projected_rss_kb,
+            candidates=candidates,
+            planned=planned,
+            stopped_count=0,
+            skipped=skipped,
+        )
+        export_latest(con)
+        con.commit()
+
+    system_bytes = system_memory_bytes()
+    swap = swap_usage_mb()
+    free_disk_gb = disk_free_gb()
+    status, reasons = pressure_status(
+        workspace_rss_kb=total_rss_kb,
+        system_bytes=system_bytes,
+        swap=swap,
+        free_disk_gb=free_disk_gb,
+        args=args,
+    )
+    if args.notify:
+        notify_pressure(status, reasons, planned, args.notify_cooldown)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "status": status,
+                    "reasons": reasons,
+                    "physical_ram_gb": round(system_bytes / 1024 / 1024 / 1024, 2) if system_bytes else None,
+                    "swap_mb": swap,
+                    "disk_free_gb": round(free_disk_gb, 2),
+                    "workspace_rss_mb": round(total_rss_kb / 1024, 1),
+                    "target_mb": round(target_rss_kb / 1024, 1),
+                    "projected_mb": round(projected_rss_kb / 1024, 1),
+                    "planned": [trim_item_summary(item) for item in planned],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0 if status == "ok" else 1
+
+    if not args.quiet:
+        ram = f"{system_bytes / 1024 / 1024 / 1024:.1f} GB" if system_bytes else "unknown"
+        print(
+            f"pressure: status={status} workspace_rss={format_mb(total_rss_kb)} "
+            f"physical_ram={ram} swap_used={swap.get('used', 0):.0f}MB/{swap.get('total', 0):.0f}MB "
+            f"swap_free={swap.get('free', 0):.0f}MB disk_free={free_disk_gb:.1f}GB"
+        )
+        for reason in reasons:
+            print(f"pressure: {reason}")
+        print_trim_report(
+            args=trim_args,
+            total_rss_kb=total_rss_kb,
+            target_rss_kb=target_rss_kb,
+            projected_rss_kb=projected_rss_kb,
+            candidates=candidates,
+            planned=planned,
+            statuses=[],
+        )
+    return 0 if status == "ok" else 1
+
+
 def default_codex_state_path() -> Path:
     return Path(os.environ.get("CMUX_CODEX_STATE", "~/.codex/state_5.sqlite")).expanduser()
 
@@ -2856,6 +3100,29 @@ def build_parser() -> argparse.ArgumentParser:
     memory_list.add_argument("--limit", type=int)
     memory_list.add_argument("--quiet", action="store_true")
     memory_list.set_defaults(func=cmd_memory_list)
+
+    pressure = sub.add_parser("pressure")
+    pressure.add_argument("--target-gb", type=float, default=24.0)
+    pressure.add_argument("--warn-workspace-gb", type=float, default=28.0)
+    pressure.add_argument("--critical-workspace-gb", type=float, default=36.0)
+    pressure.add_argument("--warn-ram-ratio", type=float, default=0.60)
+    pressure.add_argument("--critical-ram-ratio", type=float, default=0.75)
+    pressure.add_argument("--warn-swap-free-mb", type=float, default=4096.0)
+    pressure.add_argument("--critical-swap-free-mb", type=float, default=2048.0)
+    pressure.add_argument("--warn-swap-used-pct", type=float, default=75.0)
+    pressure.add_argument("--warn-disk-free-gb", type=float, default=80.0)
+    pressure.add_argument("--critical-disk-free-gb", type=float, default=40.0)
+    pressure.add_argument("--min-mb", type=float, default=128.0)
+    pressure.add_argument("--min-age", default="30m")
+    pressure.add_argument("--limit", type=int, default=6)
+    pressure.add_argument("--include-active", action="store_true")
+    pressure.add_argument("--no-snapshot", action="store_true")
+    pressure.add_argument("--notify", action="store_true")
+    pressure.add_argument("--notify-cooldown", type=float, default=15 * 60)
+    pressure.add_argument("--quiet", action="store_true")
+    pressure.add_argument("--json", action="store_true")
+    pressure.add_argument("--source", default="pressure")
+    pressure.set_defaults(func=cmd_pressure)
 
     sidebar_metrics = sub.add_parser("sidebar-metrics")
     sidebar_metrics.add_argument("--execute", action="store_true")
