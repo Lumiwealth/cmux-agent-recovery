@@ -2170,7 +2170,29 @@ def recent_cwd_fallback_can_auto_select(top: dict[str, Any], second: dict[str, A
     return top_seen - second_seen >= GENERIC_FALLBACK_AUTO_SELECT_GAP_SECONDS
 
 
-def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
+def single_exact_title_candidate(current: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if generic_workspace_title(current.get("normalized_title") or current.get("workspace_title")):
+        return None
+    title_matches = [item for item in candidates if viable_candidate(item) and item.get("title_match")]
+    if len(title_matches) != 1:
+        return None
+    if any(
+        item.get("current_screen_resume") or item.get("current_screen_transcript_match")
+        for item in candidates
+        if item is not title_matches[0]
+    ):
+        return None
+    return title_matches[0]
+
+
+def exact_title_can_auto_select(current: dict[str, Any], candidates: list[dict[str, Any]]) -> tuple[bool, dict[str, Any] | None]:
+    selected = single_exact_title_candidate(current, candidates)
+    if not selected:
+        return False, None
+    return True, selected
+
+
+def choose_candidate(args: argparse.Namespace, current: dict[str, Any], candidates: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None]:
     if args.choice is not None:
         index = args.choice - 1
         if index < 0 or index >= len(candidates):
@@ -2188,6 +2210,9 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
     if top.get("current_screen_transcript_match"):
         return "selected", top
     second = candidates[1] if len(candidates) > 1 else None
+    exact_title_ready, exact_title_selected = exact_title_can_auto_select(current, candidates)
+    if exact_title_ready:
+        return "selected", exact_title_selected
     if top.get("generic_workspace_fallback_match"):
         if recent_cwd_fallback_can_auto_select(top, second):
             return "selected", top
@@ -2236,7 +2261,7 @@ def trim_candidate_rows(
             continue
 
         session_candidates = load_candidates(con, sample)
-        status, selected = choose_candidate(chooser_args, session_candidates)
+        status, selected = choose_candidate(chooser_args, sample, session_candidates)
         if status != "selected" or selected is None:
             skipped.append({"workspace": sample, "reason": status, "candidates": session_candidates[:5]})
             continue
@@ -2789,7 +2814,7 @@ def cmd_recover(args: argparse.Namespace) -> int:
         current["screen_text"] = read_screen_text(current)
         current["screen_resume_refs"] = screen_resume_refs_from_text(current["screen_text"])
         candidates = load_candidates(con, current)
-        status, selected = choose_candidate(args, candidates)
+        status, selected = choose_candidate(args, current, candidates)
         debug_path = write_recover_debug_log(
             action=action,
             status=status,
@@ -2855,7 +2880,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
             if not ws.get("current_directory"):
                 ws["current_directory"] = str(DEFAULT_RESTORE_CWD)
             candidates = load_candidates(con, ws)
-            status, selected = choose_candidate(chooser_args, candidates)
+            status, selected = choose_candidate(chooser_args, ws, candidates)
             status = "exact" if status == "selected" else status
             top = selected or (candidates[0] if candidates else None)
             print(

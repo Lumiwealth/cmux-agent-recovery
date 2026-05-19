@@ -371,6 +371,76 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("claude-new-title-gap", recovered.stdout)
         self.assertIn("claude-old-title-gap", recovered.stdout)
 
+    def test_exact_title_beats_untitled_topic_fallback(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "CX - Adding a Broker/ENV Vars"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        transcript = self.base / "rollout-broker-env-vars.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "Add saved broker credentials and environment variables to the vault.",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        exact = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "codex-exact-broker-env", "cwd": str(self.restore_cwd), "transcript_path": str(transcript)},
+        )
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_id='old-workspace', workspace_ref='old-workspace-ref',
+                    surface_id='old-surface', surface_ref='old-surface-ref'
+                WHERE session_id='codex-exact-broker-env'
+                """
+            )
+
+        state = self.base / "codex-state.sqlite"
+        self.env["CMUX_CODEX_STATE"] = str(state)
+        topic_rollout = self.base / "rollout-schawb-broker.jsonl"
+        topic_rollout.write_text(
+            json.dumps({"type": "user", "message": {"content": "Schwab broker OAuth and saved env vars review."}}) + "\n",
+            encoding="utf-8",
+        )
+        now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+        with sqlite3.connect(state) as con:
+            con.execute(
+                "CREATE TABLE threads (id TEXT, updated_at INTEGER, cwd TEXT, rollout_path TEXT, title TEXT, model TEXT, approval_mode TEXT, sandbox_policy TEXT, archived INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-untitled-topic-broker",
+                    now - 60,
+                    str(self.restore_cwd),
+                    str(topic_rollout),
+                    "Schwab broker OAuth and saved environment variables",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("codex-exact-broker-env", recovered.stdout)
+        self.assertNotIn("multiple possible sessions", recovered.stdout)
+
     def test_generic_development_tab_lists_recent_untitled_codex_state(self) -> None:
         tree = json.loads(json.dumps(TREE))
         tree["windows"][0]["workspaces"][0]["title"] = "Development"

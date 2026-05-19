@@ -75,6 +75,23 @@ Findings on 2026-05-19:
 - The likely cause is the stale `cmux codex-hook ...` command in the Codex hook config plus the earlier disabled hooks setting. Sessions started while that config was broken could run without creating the native CMUX monitor state.
 - The hook config fix applies to future Codex hook events. Existing sessions that missed `SessionStart` may not retroactively get the native running badge until they emit a fresh hook event or are restarted/resumed after the hook fix.
 
+## Exact-title recovery over topic fallbacks
+
+Rob reported that `cmr` in `CX - Adding a Broker/ENV Vars` still asked him to choose between three Codex sessions:
+
+- Correct exact-title session: `019e1513-1ecb-71b3-b7cd-f1cacd72535b`
+- Untitled topic fallback: `019e3e9b-1460-7cd3-b6c2-2809ad962d29`
+- Untitled topic fallback: `019e3e89-ded3-7fa3-9a42-e093bdf36ef8`
+
+The exact-title session was correct because it was explicitly titled `CX - Adding a Broker/ENV Vars` and its first prompt referenced the broker credential vault handoff. The other two were weaker untitled topic matches that happened to mention broker/env terms.
+
+Fix added on 2026-05-19:
+
+- `cmr` now auto-selects the single viable exact-title match when the only competing candidates are untitled topic guesses.
+- Generic restored tabs such as `Development` remain conservative and still require a choice when ambiguity is real.
+- A local recovery pin was added for `CX - Adding a Broker/ENV Vars` -> Codex `019e1513-1ecb-71b3-b7cd-f1cacd72535b`.
+- Regression coverage: `test_exact_title_beats_untitled_topic_fallback`.
+
 ## Chrome/memory crash context
 
 The broader Chrome crash investigation concluded:
