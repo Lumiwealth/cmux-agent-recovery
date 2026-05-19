@@ -494,8 +494,11 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertEqual(recorded.returncode, 0, recorded.stderr)
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 3)
-        self.assertIn("multiple possible sessions", recovered.stdout)
+        self.assertEqual(recovered.returncode, 2)
+        self.assertIn("no recoverable", recovered.stdout)
+        self.assertIn("CX - Bug: New Leads Missing How Found", recovered.stdout)
+        self.assertNotIn("claude-step-seven-poison", recovered.stdout)
+        self.assertNotIn("claude-step-nine-poison", recovered.stdout)
 
     def test_current_screen_resume_without_known_title_does_not_override_title(self) -> None:
         tree = json.loads(json.dumps(TREE))
@@ -523,8 +526,10 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 3, recovered.stderr)
-        self.assertIn("possible session", recovered.stdout)
+        self.assertEqual(recovered.returncode, 2, recovered.stderr)
+        self.assertIn("no recoverable", recovered.stdout)
+        self.assertIn("CX - Bug: New Leads Missing How Found", recovered.stdout)
+        self.assertNotIn("claude-linkedin-title-poison", recovered.stdout)
         self.assertNotIn(f"codex -C {self.restore_cwd} resume {screen_session}", recovered.stdout)
 
     def test_current_screen_resume_with_matching_known_title_can_override(self) -> None:
@@ -873,8 +878,10 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 3, recovered.stderr)
-        self.assertIn("possible session", recovered.stdout)
+        self.assertEqual(recovered.returncode, 2, recovered.stderr)
+        self.assertIn("no recoverable", recovered.stdout)
+        self.assertIn("CX - Fargate Deploy Test", recovered.stdout)
+        self.assertNotIn("claude-linkedin-content-poison", recovered.stdout)
         self.assertNotIn("codex-fargate-deploy", recovered.stdout)
 
     def test_exact_posthog_title_beats_broad_topic_match(self) -> None:

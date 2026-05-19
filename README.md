@@ -59,7 +59,7 @@ cd "$HOME/Development" && claude --resume <session-id>
 cd "$HOME/Development" && codex -C "$HOME/Development" resume <session-id>
 ```
 
-If multiple sessions match, or if exact-title matches were downgraded by a safety heuristic, `cmr` prints choices with the workspace name:
+If multiple plausible sessions match, `cmr` prints choices with the workspace name:
 
 ```text
 cmr: multiple possible sessions found for workspace 'Release Notes'. Pick one with `cmr N`:
@@ -92,6 +92,8 @@ cmr --dry-run
 ```
 
 Dry run uses the same match selection as normal recovery. It only prints the command instead of executing it.
+
+Exact-title matches can still be rejected when the transcript clearly belongs to a generic workflow and has no independent match to the requested tab topic, screen, workspace id, or cwd. This prevents renamed tabs from offering stale LinkedIn workflow sessions as recoverable choices.
 
 For Claude Code, `cmr` prefers the project directory that owns the Claude transcript when it can prove that path. That matters when a session used `cd` during the conversation: Claude may store the resumable session under the original project even if the latest hook saw a child folder.
 

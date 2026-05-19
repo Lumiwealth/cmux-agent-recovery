@@ -1375,10 +1375,14 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
                 score = 1
             else:
                 continue
-        if pinned:
-            score += 50000
         score += int(topic.get("topic_relevance") or 0)
         score -= int(topic.get("topic_penalty") or 0)
+        if generic_workflow_topic_mismatch(item):
+            continue
+        if score <= 0 and not pinned:
+            continue
+        if pinned:
+            score += 50000
         if int(topic.get("topic_relevance") or 0) >= 36:
             age = max(0.0, time.time() - parse_time(item.get("last_seen")))
             if age < 24 * 60 * 60:
@@ -2045,6 +2049,18 @@ def strong_candidate_match(item: dict[str, Any]) -> bool:
         return True
     strong_keys = ("surface_match", "workspace_id_match", "workspace_ref_match", "cwd_match", "resume_cwd_match", "index_match")
     return any(item.get(key) for key in strong_keys)
+
+
+def generic_workflow_topic_mismatch(item: dict[str, Any]) -> bool:
+    if item.get("pinned"):
+        return False
+    if not item.get("title_match"):
+        return False
+    if int(item.get("topic_penalty") or 0) <= 0:
+        return False
+    if strong_candidate_match(item):
+        return False
+    return not substantial_topic_hits(item.get("topic_hits") or [])
 
 
 def viable_candidate(item: dict[str, Any]) -> bool:

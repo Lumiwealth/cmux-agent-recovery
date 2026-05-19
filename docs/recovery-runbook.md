@@ -39,7 +39,7 @@ The resolver scores candidates with several signals:
 
 Surface/workspace IDs are useful inside one CMUX lifecycle but may change after a crash or relaunch, so title plus recency is the main fallback. Workspace titles are matched literally and are not parsed for Claude/Codex metadata. Ambiguous matches still require `cmr N`.
 
-If `cmr` finds exact-title matches but a safety heuristic downgrades them, it should list the candidates for manual selection instead of reporting that nothing is recoverable. Missing and ambiguous messages include the workspace title so the failure can be diagnosed from copied terminal output.
+If `cmr` finds exact-title matches whose prompt content is clearly a generic workflow mismatch, it should suppress them unless there is independent evidence from the current screen, workspace id, cwd, or substantial topic hits. Missing and ambiguous messages include the workspace title so the failure can be diagnosed from copied terminal output.
 
 ## Legacy Imports
 
