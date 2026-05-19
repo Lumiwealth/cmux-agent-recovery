@@ -289,6 +289,7 @@ class RecoveryCliTests(unittest.TestCase):
         recovered = self.run_cli("recover", "--dry-run")
         self.assertEqual(recovered.returncode, 3)
         self.assertIn("multiple possible sessions", recovered.stdout)
+        self.assertIn("Release Notes", recovered.stdout)
 
         selected = self.run_cli("recover", "1", "--dry-run")
         self.assertEqual(selected.returncode, 0, selected.stderr)
@@ -493,8 +494,8 @@ class RecoveryCliTests(unittest.TestCase):
             self.assertEqual(recorded.returncode, 0, recorded.stderr)
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 2)
-        self.assertIn("no recoverable", recovered.stdout)
+        self.assertEqual(recovered.returncode, 3)
+        self.assertIn("multiple possible sessions", recovered.stdout)
 
     def test_current_screen_resume_without_known_title_does_not_override_title(self) -> None:
         tree = json.loads(json.dumps(TREE))
@@ -522,10 +523,9 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 2, recovered.stderr)
-        self.assertIn("no recoverable", recovered.stdout)
+        self.assertEqual(recovered.returncode, 3, recovered.stderr)
+        self.assertIn("possible session", recovered.stdout)
         self.assertNotIn(f"codex -C {self.restore_cwd} resume {screen_session}", recovered.stdout)
-        self.assertNotIn("claude-linkedin-title-poison", recovered.stdout)
 
     def test_current_screen_resume_with_matching_known_title_can_override(self) -> None:
         tree = json.loads(json.dumps(TREE))
@@ -873,10 +873,9 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertEqual(poisoned.returncode, 0, poisoned.stderr)
 
         recovered = self.run_cli("recover", "--dry-run")
-        self.assertEqual(recovered.returncode, 2, recovered.stderr)
-        self.assertIn("no recoverable", recovered.stdout)
+        self.assertEqual(recovered.returncode, 3, recovered.stderr)
+        self.assertIn("possible session", recovered.stdout)
         self.assertNotIn("codex-fargate-deploy", recovered.stdout)
-        self.assertNotIn("claude-linkedin-content-poison", recovered.stdout)
 
     def test_exact_posthog_title_beats_broad_topic_match(self) -> None:
         tree = json.loads(json.dumps(TREE))
@@ -1085,6 +1084,7 @@ class RecoveryCliTests(unittest.TestCase):
         recovered = self.run_cli("recover", "--dry-run")
         self.assertEqual(recovered.returncode, 2)
         self.assertIn("no recoverable", recovered.stdout)
+        self.assertIn("Release Notes", recovered.stdout)
         self.assertNotIn("claude\n", recovered.stdout)
         self.assertNotIn("codex\n", recovered.stdout)
 

@@ -2061,6 +2061,8 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
         return "missing", None
     top = candidates[0]
     if not viable_candidate(top):
+        if top.get("title_match"):
+            return "ambiguous", None
         return "missing", None
     if top.get("current_screen_resume"):
         return "selected", top
@@ -2072,6 +2074,10 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
     if top["score"] >= 75 and (second is None or top["score"] - second["score"] >= 20):
         return "selected", top
     return "ambiguous", None
+
+
+def workspace_label(current: dict[str, Any]) -> str:
+    return current.get("workspace_title") or current.get("normalized_title") or "unknown workspace"
 
 
 def trim_candidate_rows(
@@ -2341,16 +2347,19 @@ def cmd_recover(args: argparse.Namespace) -> int:
         con.commit()
 
     if status == "missing":
-        print("cmr: no recoverable Claude/Codex session found for this workspace.")
+        print(f"cmr: no recoverable Claude/Codex session found for workspace {workspace_label(current)!r}.")
         print(f"cmr: debug log {debug_path}")
         return 2
     if status == "ambiguous":
-        print("cmr: multiple possible sessions found. Pick one with `cmr N`:")
+        if len(candidates) == 1:
+            print(f"cmr: possible session found for workspace {workspace_label(current)!r}. Pick it with `cmr 1`:")
+        else:
+            print(f"cmr: multiple possible sessions found for workspace {workspace_label(current)!r}. Pick one with `cmr N`:")
         print_candidates(candidates)
         print(f"cmr: debug log {debug_path}")
         return 3
     if status == "invalid-choice":
-        print("cmr: invalid choice. Current candidates:")
+        print(f"cmr: invalid choice for workspace {workspace_label(current)!r}. Current candidates:")
         print_candidates(candidates)
         print(f"cmr: debug log {debug_path}")
         return 4

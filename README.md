@@ -59,10 +59,10 @@ cd "$HOME/Development" && claude --resume <session-id>
 cd "$HOME/Development" && codex -C "$HOME/Development" resume <session-id>
 ```
 
-If multiple sessions match, `cmr` prints choices:
+If multiple sessions match, or if exact-title matches were downgraded by a safety heuristic, `cmr` prints choices with the workspace name:
 
 ```text
-cmr: multiple possible sessions found. Pick one with `cmr N`:
+cmr: multiple possible sessions found for workspace 'Release Notes'. Pick one with `cmr N`:
 1. codex score=100 last=2026-04-30T01:00:00Z title='Release Notes' cwd=/work/repo resume_cwd=/work/repo transcript=12.4MB
 2. codex score=90 last=2026-04-27T10:00:00Z title='Release Notes' cwd=/work/old resume_cwd=/work/old transcript=1.1MB
 ```
