@@ -41,6 +41,8 @@ Surface/workspace IDs are useful inside one CMUX lifecycle but may change after 
 
 If `cmr` finds exact-title matches whose prompt content is clearly a generic workflow mismatch, it should suppress them unless there is independent evidence from the current screen, workspace id, cwd, or substantial topic hits. Missing and ambiguous messages include the workspace title so the failure can be diagnosed from copied terminal output.
 
+For generic restored tabs named `Development`, recent Codex state rows with no stored CMUX workspace title can be the correct session if the tab crashed before Rob named it. `cmr` should keep those same-cwd rows visible as `recent-cwd` candidates, but should still require an explicit numbered choice unless the current screen transcript clearly matches that rollout.
+
 ## Legacy Imports
 
 After a crash, import the historical reports and local agent state before recovering tabs:

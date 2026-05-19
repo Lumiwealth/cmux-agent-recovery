@@ -91,6 +91,12 @@ BUG_OR_INVESTIGATION_TERMS = {
     "issue",
     "missing",
 }
+GENERIC_WORKSPACE_TITLES = {
+    "development",
+    "documents development",
+    "users robertgrzesik development",
+    "users robertgrzesik documents development",
+}
 SESSION_ID_RE = re.compile(
     r"\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,}-[0-9a-f-]{20,})\b",
     re.IGNORECASE,
@@ -144,11 +150,34 @@ def title_matches(current_title: str | None, candidate_title: str | None, candid
     return bool(current_keys and candidate_keys and current_keys & candidate_keys)
 
 
+def generic_workspace_title(value: str | None) -> bool:
+    return normalize_title(value) in GENERIC_WORKSPACE_TITLES
+
+
+def candidate_has_title(candidate: dict[str, Any] | sqlite3.Row) -> bool:
+    return bool(title_match_keys(candidate["normalized_title"]) | title_match_keys(candidate["workspace_title"]))
+
+
+def generic_workspace_fallback_match(current: dict[str, Any], candidate: dict[str, Any] | sqlite3.Row) -> bool:
+    if candidate["tool"] != "codex":
+        return False
+    if not generic_workspace_title(current.get("normalized_title") or current.get("workspace_title")):
+        return False
+    if candidate_has_title(candidate):
+        return False
+    cwd_match = same_path(current.get("current_directory"), candidate["cwd"])
+    resume_cwd = candidate_cwd(dict(candidate))
+    resume_cwd_match = same_path(current.get("current_directory"), str(resume_cwd))
+    if not (cwd_match or resume_cwd_match):
+        return False
+    age = max(0.0, time.time() - parse_time(candidate["last_seen"]))
+    return age < 7 * 24 * 60 * 60
+
+
 def screen_resume_title_allowed(current: dict[str, Any], item: dict[str, Any]) -> bool:
     if not current.get("normalized_title"):
         return True
-    candidate_has_title = bool(title_match_keys(item.get("normalized_title")) | title_match_keys(item.get("workspace_title")))
-    if not candidate_has_title:
+    if not candidate_has_title(item):
         return False
     return title_matches(current.get("normalized_title"), item.get("normalized_title"), item.get("workspace_title"))
 
@@ -1274,6 +1303,7 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
     candidate_title = candidate["normalized_title"]
     candidate_workspace_title = normalize_title(candidate["workspace_title"])
     title_match = title_matches(current_title, candidate_title, candidate_workspace_title)
+    fallback_match = generic_workspace_fallback_match(current, candidate)
     surface_match = bool(current.get("surface_id") and current.get("surface_id") == candidate["surface_id"])
     workspace_id_match = bool(current.get("workspace_id") and current.get("workspace_id") == candidate["workspace_id"])
     raw_workspace_ref_match = bool(current.get("workspace_ref") and current.get("workspace_ref") == candidate["workspace_ref"])
@@ -1290,9 +1320,10 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
     resume_cwd = candidate_cwd(dict(candidate))
     resume_cwd_match = same_path(current.get("current_directory"), str(resume_cwd))
 
-    # The tab title is the source of truth. Workspace/surface IDs and topic
-    # text only help rank candidates after the title matches exactly.
-    if not title_match:
+    # The tab title is the source of truth. For generic restored tabs like
+    # "Development", Codex state may be the only recent record because Rob did
+    # not get a chance to name the workspace before the crash.
+    if not title_match and not fallback_match:
         return 0
 
     if surface_match:
@@ -1303,6 +1334,8 @@ def score_candidate(current: dict[str, Any], candidate: sqlite3.Row) -> int:
         score += 35
     if title_match:
         score += 110
+    if fallback_match:
+        score += 120
     if cwd_match:
         score += 25
     if resume_cwd_match and not cwd_match:
@@ -1350,6 +1383,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             item["normalized_title"] = pin["normalized_title"] or item.get("normalized_title")
         item["pinned"] = pinned
         item["title_match"] = title_matches(current.get("normalized_title"), item.get("normalized_title"), item.get("workspace_title"))
+        item["generic_workspace_fallback_match"] = generic_workspace_fallback_match(current, item)
         item["surface_match"] = bool(current.get("surface_id") and current.get("surface_id") == item.get("surface_id"))
         item["workspace_id_match"] = bool(current.get("workspace_id") and current.get("workspace_id") == item.get("workspace_id"))
         item["workspace_ref_match"] = bool(
@@ -1431,6 +1465,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             "pinned": False,
             "current_screen_resume": True,
             "title_match": title_matches(current.get("normalized_title"), base.get("normalized_title"), base.get("workspace_title")),
+            "generic_workspace_fallback_match": generic_workspace_fallback_match(current, base) if base else False,
             "surface_match": True,
             "workspace_id_match": True,
             "workspace_ref_match": True,
@@ -1469,6 +1504,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             item = dict(row)
             item["pinned"] = False
             item["title_match"] = title_matches(current.get("normalized_title"), item.get("normalized_title"), item.get("workspace_title"))
+            item["generic_workspace_fallback_match"] = generic_workspace_fallback_match(current, item)
             item["surface_match"] = bool(current.get("surface_id") and current.get("surface_id") == item.get("surface_id"))
             item["workspace_id_match"] = bool(current.get("workspace_id") and current.get("workspace_id") == item.get("workspace_id"))
             item["workspace_ref_match"] = bool(current.get("workspace_ref") and current.get("workspace_ref") == item.get("workspace_ref"))
@@ -1515,6 +1551,7 @@ def load_candidates(con: sqlite3.Connection, current: dict[str, Any]) -> list[di
             "score": 50000,
             "pinned": True,
             "title_match": True,
+            "generic_workspace_fallback_match": False,
             "surface_match": False,
             "workspace_id_match": False,
             "workspace_ref_match": False,
@@ -1894,11 +1931,12 @@ def print_candidates(candidates: list[dict[str, Any]], limit: int = 8) -> None:
         prompt = item.get("first_user_prompt")
         pin = " pinned" if item.get("pinned") else ""
         screen = " screen" if item.get("current_screen_resume") or item.get("current_screen_transcript_match") else ""
+        fallback = " recent-cwd" if item.get("generic_workspace_fallback_match") else ""
         topic = ""
         if item.get("topic_relevance") or item.get("topic_penalty"):
             topic = f" topic=+{int(item.get('topic_relevance') or 0)}/-{int(item.get('topic_penalty') or 0)}"
         print(
-            f"{idx}. {item['tool']}{pin}{screen} session={item.get('session_id')} score={item['score']} last={item.get('last_seen')} "
+            f"{idx}. {item['tool']}{pin}{screen}{fallback} session={item.get('session_id')} score={item['score']} last={item.get('last_seen')} "
             f"title={title!r} cwd={cwd} resume_cwd={resume_cwd}{size}{topic}"
         )
         if prompt:
@@ -1944,6 +1982,7 @@ def public_candidate_summary(item: dict[str, Any]) -> dict[str, Any]:
         "cwd",
         "resume_cwd",
         "title_match",
+        "generic_workspace_fallback_match",
         "surface_match",
         "workspace_id_match",
         "workspace_ref_match",
@@ -2082,6 +2121,10 @@ def choose_candidate(args: argparse.Namespace, candidates: list[dict[str, Any]])
         return "missing", None
     if top.get("current_screen_resume"):
         return "selected", top
+    if top.get("current_screen_transcript_match"):
+        return "selected", top
+    if top.get("generic_workspace_fallback_match"):
+        return "ambiguous", None
     second = candidates[1] if len(candidates) > 1 else None
     top_strong = strong_candidate_match(top)
     second_title_match = bool(second and viable_candidate(second) and second.get("title_match"))

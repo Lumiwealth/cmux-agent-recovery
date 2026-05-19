@@ -370,6 +370,97 @@ class RecoveryCliTests(unittest.TestCase):
         self.assertIn("claude-new-title-gap", recovered.stdout)
         self.assertIn("claude-old-title-gap", recovered.stdout)
 
+    def test_generic_development_tab_lists_recent_untitled_codex_state(self) -> None:
+        tree = json.loads(json.dumps(TREE))
+        tree["windows"][0]["workspaces"][0]["title"] = "Development"
+        self.env["CMUX_FAKE_TREE_JSON"] = json.dumps(tree)
+
+        state = self.base / "codex-state.sqlite"
+        self.env["CMUX_CODEX_STATE"] = str(state)
+        rollout = self.base / "rollout-cmr-memory.jsonl"
+        rollout.write_text(
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "Fix the cmr command and cmux memory crash recovery.",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        other_rollout = self.base / "rollout-other.jsonl"
+        other_rollout.write_text(
+            json.dumps({"type": "user", "message": {"content": "Review Peter H client work."}}) + "\n",
+            encoding="utf-8",
+        )
+        with sqlite3.connect(state) as con:
+            con.execute(
+                "CREATE TABLE threads (id TEXT, updated_at INTEGER, cwd TEXT, rollout_path TEXT, title TEXT, model TEXT, approval_mode TEXT, sandbox_policy TEXT, archived INTEGER)"
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-cmr-memory-fix",
+                    2000000000,
+                    str(self.restore_cwd),
+                    str(rollout),
+                    "Fix cmr command and cmux memory crash recovery",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+            con.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "codex-other-recent",
+                    1999999900,
+                    str(self.restore_cwd),
+                    str(other_rollout),
+                    "Review Peter H client work",
+                    "gpt",
+                    "never",
+                    "workspace-write",
+                    0,
+                ),
+            )
+
+        stale = self.run_cli(
+            "record",
+            "--tool",
+            "codex",
+            "--event",
+            "UserPromptSubmit",
+            input_json={"session_id": "codex-stale-development", "cwd": str(self.restore_cwd)},
+        )
+        self.assertEqual(stale.returncode, 0, stale.stderr)
+        with sqlite3.connect(self.db) as con:
+            con.execute(
+                """
+                UPDATE session_bindings
+                SET workspace_title='Development',
+                    normalized_title='development',
+                    workspace_id='old-workspace',
+                    workspace_ref='old-workspace-ref',
+                    surface_id='old-surface',
+                    surface_ref='old-surface-ref',
+                    workspace_index=NULL,
+                    last_seen='2026-04-29T00:00:00Z'
+                WHERE session_id='codex-stale-development'
+                """
+            )
+
+        recovered = self.run_cli("recover", "--dry-run")
+        self.assertEqual(recovered.returncode, 3)
+        self.assertIn("multiple possible sessions", recovered.stdout)
+        self.assertIn("codex recent-cwd session=codex-cmr-memory-fix", recovered.stdout)
+        self.assertIn("Fix the cmr command and cmux memory crash recovery", recovered.stdout)
+        self.assertIn("codex-other-recent", recovered.stdout)
+
     def test_old_matching_title_is_not_lost_behind_recent_global_limit(self) -> None:
         old = self.run_cli(
             "record",
