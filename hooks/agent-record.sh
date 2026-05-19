@@ -7,5 +7,4 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Hooks must be silent. Claude UserPromptSubmit stdout becomes model context,
 # and Codex may show hook output in the TUI.
-"$ROOT/bin/cmux-recovery" record --tool "$TOOL" --event "$EVENT" >/dev/null 2>&1 || true
-
+CMUX_RECOVERY_DISABLE_MEMORY=1 "$ROOT/bin/cmux-recovery" record --tool "$TOOL" --event "$EVENT" >/dev/null 2>&1 || true
